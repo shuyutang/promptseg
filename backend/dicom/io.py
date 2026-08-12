@@ -6,9 +6,11 @@ from dataclasses import dataclass, field
 import numpy as np
 import pydicom
 try:  # pydicom >= 3
-    from pydicom.pixels import apply_modality_lut, apply_voi_lut
+    from pydicom.pixels import apply_color_lut, apply_modality_lut, apply_voi_lut
 except ImportError:  # pragma: no cover - pydicom 2.x
-    from pydicom.pixel_data_handlers.util import apply_modality_lut, apply_voi_lut
+    from pydicom.pixel_data_handlers.util import (
+        apply_color_lut, apply_modality_lut, apply_voi_lut,
+    )
 
 
 @dataclass
@@ -117,7 +119,13 @@ def _raw_frame(img: DicomImage, frame: int) -> np.ndarray:
     if n_frames > 1 and arr.ndim >= 3:
         arr = arr[sub]  # (F,H,W) or (F,H,W,3) -- this is the frame bug that was here
 
-    if _is_color(ds, arr):
+    photo = str(getattr(ds, "PhotometricInterpretation", "") or "").upper()
+    if photo == "PALETTE COLOR":
+        # SamplesPerPixel is 1, but the stored values are palette indices, not
+        # intensities -- rendering them as grayscale shows the wrong image.
+        rgb = apply_color_lut(arr, ds)
+        out = rgb.astype(np.uint8) if rgb.dtype == np.uint8 else _minmax_u8(rgb.astype(np.float32))
+    elif _is_color(ds, arr):
         out = arr if arr.dtype == np.uint8 else _minmax_u8(arr.astype(np.float32))
     else:
         if arr.ndim == 3 and arr.shape[-1] == 1:

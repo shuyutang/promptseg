@@ -20,11 +20,15 @@ from pydicom.data import get_testdata_file  # noqa: E402
 #   MR_small   16-bit monochrome MR
 #   emri_small multi-frame MR (10 frames in one file)
 #   US1_J2KR   colour ultrasound, JPEG2000-compressed
+#   OBXXXX1A   PALETTE COLOR ultrasound (indices, not intensities)
+#   RG1_UNCR   MONOCHROME1 chest CR (inverted display)
 FIXTURES = {
     "ct": "CT_small.dcm",
     "mr": "MR_small.dcm",
     "multiframe": "emri_small.dcm",
     "us_color": "US1_J2KR.dcm",
+    "us_palette": "OBXXXX1A.dcm",
+    "cr_mono1": "RG1_UNCR.dcm",
 }
 
 

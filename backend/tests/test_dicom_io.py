@@ -20,6 +20,23 @@ def test_color_ultrasound_stays_rgb(dicom_bytes):
     assert frame_rgb(img, 0).shape[-1] == 3
 
 
+def test_palette_color_is_expanded_to_rgb(dicom_bytes):
+    """PALETTE COLOR stores indices, not intensities; showing them raw is wrong."""
+    img = load_single(dicom_bytes["us_palette"])
+    assert img.meta["photometric_interpretation"] == "PALETTE COLOR"
+    arr = frame_uint8(img, 0)
+    assert arr.ndim == 3 and arr.shape[-1] == 3
+    # A real palette image is not grey: channels must actually differ somewhere.
+    assert not np.array_equal(arr[..., 0], arr[..., 1])
+
+
+def test_monochrome1_is_inverted(dicom_bytes):
+    """MONOCHROME1 means high value = dark; CR images look like negatives otherwise."""
+    img = load_single(dicom_bytes["cr_mono1"])
+    assert img.meta["photometric_interpretation"] == "MONOCHROME1"
+    assert frame_uint8(img, 0).dtype == np.uint8
+
+
 def test_multiframe_returns_distinct_frames(dicom_bytes):
     """Regression: every frame used to decode as frame 0."""
     img = load_single(dicom_bytes["multiframe"])

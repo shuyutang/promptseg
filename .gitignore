@@ -8,3 +8,4 @@ __pycache__/
 exports/
 .env
 nohup.out
+samples/

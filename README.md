@@ -28,6 +28,32 @@ docker build -t sam2web-backend backend/
 ./backend/start_server.sh
 ```
 
+## Sample data
+
+```bash
+.venv/bin/python scripts/make_samples.py     # writes ./samples/
+```
+
+Copies a curated set of the public DICOMs bundled with pydicom (no PHI, no
+downloads) and explodes a multi-frame MR into a real 10-slice zipped series:
+
+| File | What it exercises |
+| --- | --- |
+| `CT_small.dcm` | 128×128 chest CT — fastest thing to try first |
+| `693_UNCR.dcm` | 512×512 CT at realistic resolution |
+| `MR2_UNCR.dcm` | 1024×1024 MR |
+| `MR-SIEMENS-DICOM-WithOverlays.dcm` | 484×484 Siemens MR |
+| `emri_small.dcm` | 64×64 MR, 10 frames — frame scrubbing |
+| `emri_series.zip` | 10-slice MR series — the zip upload + z-sorting path |
+| `RG1_UNCR.dcm` | 1955×1841 chest CR, MONOCHROME1 — inversion and window/level |
+| `JPGLosslessP14SV1_1s_1f_8b.dcm` | 768×1024 grayscale ultrasound |
+| `US1_J2KR.dcm` | 480×640 colour US, JPEG2000 |
+| `OBXXXX1A.dcm` | 600×800 obstetric US, PALETTE COLOR |
+| `color3d_jpeg_baseline.dcm` | 480×640 colour US cine, 120 frames |
+
+For richer clinical data, [TCIA](https://www.cancerimagingarchive.net/) publishes
+whole CC-BY studies as DICOM (download a series, zip it, upload it).
+
 ## Using it
 
 | Action | Input |
@@ -51,10 +77,15 @@ is regenerated rather than patched.
 The image encoder is the expensive part of SAM 2 and depends only on the pixels,
 so it is split from the prompt decoder and cached per `(image, frame, window)`:
 
-| | RTX 4090, 128×128 CT |
-| --- | --- |
-| Cold (encode + decode) | ~45 ms |
-| Cached edit (decode only) | ~9 ms |
+| RTX 4090 | Cold (encode + decode) | Cached edit |
+| --- | --- | --- |
+| 128×128 CT | ~45 ms | ~9 ms |
+| 600×800 US | ~55 ms | ~20 ms |
+| 1955×1841 CR | ~198 ms | ~117 ms |
+
+The encoder always runs at 1024×1024, so cold cost is near-constant; what grows
+with image size is upscaling the mask logits back to native resolution and
+RLE-encoding them. Large radiographs stay usable but stop feeling instant.
 
 The window/level setting is part of the cache key because re-windowing changes
 the pixels the encoder sees. It is also stored on every annotation, so an edit
