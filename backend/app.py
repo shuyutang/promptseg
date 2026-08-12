@@ -9,7 +9,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 
 from config import settings
-from dicom.io import default_window, frame_rgb, frame_uint8, load_single, load_zip_series
+from dicom.io import (
+    default_window, frame_rgb, frame_shape, frame_shapes, frame_uint8,
+    has_uniform_geometry, load_single, load_zip_series,
+)
 from labels import canonical, hex_to_rgb
 from models.sam2_runner import Sam2Runner
 from schemas import AnnotationCreate, AnnotationOut, AnnotationUpdate, PreviewRequest, Window
@@ -123,7 +126,23 @@ async def upload(file: UploadFile = File(...)):
         "frames": image.frames,
         "meta": image.meta,
         "default_window": {"center": wc, "width": ww},
+        # Per-frame geometry: a zipped folder can mix image sizes, and the
+        # viewer must resize per frame or clicks land at the wrong coordinates.
+        "frame_shapes": frame_shapes(image),
+        "uniform_geometry": has_uniform_geometry(image),
     }
+
+
+@app.get("/frame_info")
+def frame_info(image_id: str = Query(...), frame: int = Query(0)):
+    rec = _rec(image_id)
+    try:
+        rows, cols = frame_shape(rec.image, frame)
+    except IndexError as e:
+        raise HTTPException(400, str(e))
+    wc, ww = default_window(rec.image, frame)
+    return {"frame": frame, "rows": rows, "columns": cols,
+            "default_window": {"center": wc, "width": ww}}
 
 
 @app.get("/frame.png")
@@ -229,8 +248,10 @@ def annotations_overlay(image_id: str = Query(...), frame: int = Query(0),
                         selected: Optional[str] = None, alpha: int = Query(110)):
     """All committed masks on this frame, composited with per-label colours."""
     rec = _rec(image_id)
-    h = rec.image.meta.get("rows") or 0
-    w = rec.image.meta.get("columns") or 0
+    try:
+        h, w = frame_shape(rec.image, frame)
+    except IndexError as e:
+        raise HTTPException(400, str(e))
 
     items = []
     for a in rec.annotations.values():

@@ -149,12 +149,14 @@ $('file').onchange = async e => {
   const d = await r.json();
 
   S.imageId = d.image_id; S.frames = d.frames; S.frame = 0;
-  S.w = d.meta.columns; S.h = d.meta.rows;
+  S.shapes = d.frame_shapes || [[d.meta.rows, d.meta.columns]];
+  [S.h, S.w] = S.shapes[0];
   S.defWin = d.default_window;
   S.wc = d.default_window.center; S.ww = d.default_window.width;
   S.points = []; S.boxes = []; S.selected = null; S.anns = []; S.maskIndex = 0;
 
-  $('imginfo').textContent = `${d.meta.modality || '?'} · ${S.w}×${S.h} · ${d.frames} frame(s)`;
+  $('imginfo').textContent = `${d.meta.modality || '?'} · ${S.w}×${S.h} · ${d.frames} frame(s)`
+    + (d.uniform_geometry === false ? ' · mixed sizes' : '');
   $('frame').max = d.frames - 1; $('frame').value = 0;
   const span = Math.max(S.ww * 4, 512);
   $('wc').min = S.wc - span; $('wc').max = S.wc + span; $('wc').step = span / 500; $('wc').value = S.wc;
@@ -186,10 +188,18 @@ function refreshFrame() {
   refreshCommitted();
   schedulePreview();
 }
-$('frame').oninput = e => {
-  S.frame = +e.target.value; S.points = []; S.boxes = []; S.selected = null;
+function setFrame(n) {
+  S.frame = n; S.points = []; S.boxes = []; S.selected = null;
+  // Frames in a zipped folder may differ in size; re-fit before drawing.
+  const shape = S.shapes[n];
+  if (shape && (shape[0] !== S.h || shape[1] !== S.w)) {
+    [S.h, S.w] = shape;
+    S.zoom = Math.max(1, Math.min(6, Math.floor(520 / Math.max(S.w, S.h)) || 1));
+    applyZoom();
+  }
   clearPreview(); refreshFrame(); refreshList();
-};
+}
+$('frame').oninput = e => setFrame(+e.target.value);
 $('wc').oninput = e => { S.wc = +e.target.value; refreshFrame(); };
 $('ww').oninput = e => { S.ww = +e.target.value; refreshFrame(); };
 $('resetwin').onclick = () => {
@@ -376,7 +386,15 @@ async function refreshList() {
 
 function selectMask(a) {
   S.selected = a.id;
-  if (a.frame !== S.frame) { S.frame = a.frame; $('frame').value = a.frame; }
+  if (a.frame !== S.frame) {
+    S.frame = a.frame; $('frame').value = a.frame;
+    const shape = S.shapes[a.frame];
+    if (shape && (shape[0] !== S.h || shape[1] !== S.w)) {
+      [S.h, S.w] = shape;
+      S.zoom = Math.max(1, Math.min(6, Math.floor(520 / Math.max(S.w, S.h)) || 1));
+      applyZoom();
+    }
+  }
   // Load the stored prompts back so the mask can be refined, not redrawn.
   S.points = (a.prompts.points || []).map(p => ({ x: p.x, y: p.y, label: p.label }));
   S.boxes = (a.prompts.boxes || []).map(b => b.slice());
@@ -410,8 +428,8 @@ window.addEventListener('keydown', e => {
   if (e.key === 'Escape') $('clear').onclick();
   if (e.key === 'Enter') $('commit').onclick();
   if (e.key === 'c') $('cycle').onclick();
-  if (e.key === 'ArrowLeft' && S.frame > 0) { $('frame').value = --S.frame; $('frame').oninput({ target: { value: S.frame } }); }
-  if (e.key === 'ArrowRight' && S.frame < S.frames - 1) { $('frame').value = ++S.frame; $('frame').oninput({ target: { value: S.frame } }); }
+  if (e.key === 'ArrowLeft' && S.frame > 0) { $('frame').value = S.frame - 1; setFrame(S.frame - 1); }
+  if (e.key === 'ArrowRight' && S.frame < S.frames - 1) { $('frame').value = S.frame + 1; setFrame(S.frame + 1); }
 });
 </script>
 </body>

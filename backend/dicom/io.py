@@ -107,6 +107,25 @@ def dataset_for_frame(img: DicomImage, frame: int) -> tuple[pydicom.Dataset, int
     return img.datasets[0], frame
 
 
+def frame_shape(img: DicomImage, frame: int) -> tuple[int, int]:
+    """(rows, columns) of one frame.
+
+    A zipped folder may hold images of different sizes, so geometry is per
+    frame, not per study. Read from the header -- no pixel decode.
+    """
+    ds, _ = dataset_for_frame(img, frame)
+    return int(getattr(ds, "Rows", 0) or 0), int(getattr(ds, "Columns", 0) or 0)
+
+
+def frame_shapes(img: DicomImage) -> list[list[int]]:
+    return [list(frame_shape(img, f)) for f in range(img.frames)]
+
+
+def has_uniform_geometry(img: DicomImage) -> bool:
+    shapes = frame_shapes(img)
+    return all(s == shapes[0] for s in shapes)
+
+
 def _raw_frame(img: DicomImage, frame: int) -> np.ndarray:
     """Decoded frame after the modality LUT. Grayscale float32, or uint8 RGB."""
     if frame in img._cache:

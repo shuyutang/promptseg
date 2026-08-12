@@ -23,6 +23,40 @@ def test_upload_reports_geometry(client, dicom_bytes):
     assert "center" in d["default_window"]
 
 
+def test_mixed_size_zip_reports_per_frame_geometry(client, dicom_bytes):
+    """A zipped folder can hold differently-sized images. Reporting one size for
+    the whole study made the viewer map clicks to the wrong coordinates."""
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("a.dcm", dicom_bytes["ct"])   # 128x128
+        zf.writestr("b.dcm", dicom_bytes["mr"])   # 64x64
+    r = client.post("/dicom/upload", files={"file": ("folder.zip", buf.getvalue(), "application/zip")})
+    d = r.json()
+
+    assert d["frames"] == 2
+    assert d["uniform_geometry"] is False
+    shapes = [tuple(s) for s in d["frame_shapes"]]
+    assert len(set(shapes)) == 2, f"expected differing frame sizes, got {shapes}"
+
+    # Per-frame info must match the actual rendered frame.
+    for f, (rows, cols) in enumerate(shapes):
+        info = client.get(f"/frame_info?image_id={d['image_id']}&frame={f}").json()
+        assert (info["rows"], info["columns"]) == (rows, cols)
+
+    # And the overlay canvas must match the frame, not the first slice.
+    ov = client.get(f"/annotations/overlay.png?image_id={d['image_id']}&frame=1")
+    assert ov.status_code == 200
+
+
+def test_uniform_series_reports_uniform(client, series_zip):
+    d = client.post("/dicom/upload", files={"file": ("s.zip", series_zip, "application/zip")}).json()
+    assert d["uniform_geometry"] is True
+    assert len(d["frame_shapes"]) == d["frames"]
+
+
 def test_unknown_image_id_is_404(client):
     assert client.get("/frame.png?image_id=nope&frame=0").status_code == 404
 
