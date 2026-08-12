@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sam2web — DICOM segmentation</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --line: #2a3240;
+    --fg: #e6edf3; --muted: #8b949e; --accent: #3b82f6;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; height: 100vh; display: flex; background: var(--bg); color: var(--fg);
+         font: 13px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif; }
+
+  aside { width: 320px; flex: none; background: var(--panel); border-right: 1px solid var(--line);
+          overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 14px; }
+  main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+
+  h1 { font-size: 14px; margin: 0; letter-spacing: .02em; }
+  h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+       color: var(--muted); margin: 0 0 6px; font-weight: 600; }
+  section { border-top: 1px solid var(--line); padding-top: 12px; }
+  section:first-of-type { border-top: 0; padding-top: 0; }
+
+  button { background: #21262d; color: var(--fg); border: 1px solid var(--line);
+           border-radius: 6px; padding: 6px 10px; cursor: pointer; font-size: 12px; }
+  button:hover:not(:disabled) { border-color: #4b5563; background: #2a313c; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.danger { background: #3d1d1d; border-color: #6b2b2b; }
+  .row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .row > * { min-width: 0; }
+
+  input[type=text], input[type=number] {
+    background: #0d1117; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 8px; font-size: 12px; width: 100%; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  label.field { display: block; font-size: 11px; color: var(--muted); margin-bottom: 3px; }
+
+  #viewport { flex: 1; position: relative; overflow: auto; display: grid; place-items: center;
+              background: #05070a; padding: 20px; }
+  #stack { position: relative; line-height: 0; box-shadow: 0 0 0 1px var(--line); }
+  #stack img, #stack canvas { position: absolute; inset: 0; width: 100%; height: 100%;
+                              image-rendering: pixelated; }
+  #base { position: relative !important; }
+  #marks { cursor: crosshair; }
+
+  #masklist { display: flex; flex-direction: column; gap: 4px; }
+  .mask { display: flex; align-items: center; gap: 8px; padding: 6px; border-radius: 6px;
+          border: 1px solid transparent; cursor: pointer; }
+  .mask:hover { background: #1c2331; }
+  .mask.sel { border-color: var(--accent); background: #16233a; }
+  .swatch { width: 12px; height: 12px; border-radius: 3px; flex: none; }
+  .mask .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mask .meta { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+
+  #status { padding: 6px 14px; border-top: 1px solid var(--line); color: var(--muted);
+            font-size: 12px; background: var(--panel); min-height: 30px; }
+  .hint { color: var(--muted); font-size: 11px; }
+  .err { color: #f87171; }
+  .pill { background:#0d1117; border:1px solid var(--line); border-radius:999px;
+          padding:1px 7px; font-size:11px; color:var(--muted); }
+</style>
+</head>
+<body>
+<aside>
+  <h1>sam2web <span class="pill" id="modelpill">…</span></h1>
+
+  <section>
+    <h2>Image</h2>
+    <input type="file" id="file" accept=".dcm,.zip,application/dicom" style="font-size:11px">
+    <div class="hint" id="imginfo" style="margin-top:6px">No image loaded.</div>
+  </section>
+
+  <section id="viewctl" hidden>
+    <h2>View</h2>
+    <label class="field">Frame <span id="framelbl">0</span></label>
+    <input type="range" id="frame" min="0" max="0" value="0">
+    <label class="field" style="margin-top:8px">Window centre <span id="wclbl"></span></label>
+    <input type="range" id="wc">
+    <label class="field" style="margin-top:8px">Window width <span id="wwlbl"></span></label>
+    <input type="range" id="ww">
+    <div class="row" style="margin-top:8px">
+      <button id="resetwin">Reset window</button>
+      <button id="zoomout">−</button><button id="zoomin">+</button>
+    </div>
+  </section>
+
+  <section id="promptctl" hidden>
+    <h2>Prompt</h2>
+    <div class="hint">Left-click = include · Right-click / Shift = exclude · Drag = box</div>
+    <div class="row" style="margin-top:8px">
+      <button id="cycle">Next candidate</button>
+      <button id="clear">Clear</button>
+    </div>
+    <label class="field" style="margin-top:10px">Label</label>
+    <input type="text" id="label" list="labellist" placeholder="e.g. vertebra" autocomplete="off">
+    <datalist id="labellist"></datalist>
+    <div class="row" style="margin-top:8px">
+      <button class="primary" id="commit" style="flex:1">Add mask</button>
+    </div>
+    <div class="hint" id="editnote" style="margin-top:6px"></div>
+  </section>
+
+  <section id="listctl" hidden>
+    <h2>Masks <span id="count" class="pill">0</span></h2>
+    <div id="masklist"></div>
+    <div class="row" style="margin-top:10px">
+      <button id="export" style="flex:1">Export JSON</button>
+    </div>
+  </section>
+</aside>
+
+<main>
+  <div id="viewport">
+    <div id="stack" hidden>
+      <img id="base">
+      <img id="committed">
+      <img id="preview">
+      <canvas id="marks"></canvas>
+    </div>
+  </div>
+  <div id="status">Load a DICOM file to begin.</div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const S = {
+  imageId: null, frames: 1, frame: 0, w: 0, h: 0,
+  wc: 0, ww: 1, defWin: null, zoom: 1,
+  points: [], boxes: [], drag: null,
+  maskIndex: 0, selected: null, anns: [], busy: false,
+};
+
+function say(msg, isErr) { $('status').innerHTML = isErr ? `<span class="err">${msg}</span>` : msg; }
+
+fetch('/health').then(r => r.json()).then(h => {
+  $('modelpill').textContent = (h.model === 'stub' ? 'stub' : h.model.split('/').pop()) + ' · ' + h.device;
+}).catch(() => {});
+
+// ---- upload ---------------------------------------------------------
+$('file').onchange = async e => {
+  const f = e.target.files[0]; if (!f) return;
+  say('Uploading…');
+  const fd = new FormData(); fd.append('file', f);
+  const r = await fetch('/dicom/upload', { method: 'POST', body: fd });
+  if (!r.ok) return say('Upload failed: ' + (await r.text()), true);
+  const d = await r.json();
+
+  S.imageId = d.image_id; S.frames = d.frames; S.frame = 0;
+  S.w = d.meta.columns; S.h = d.meta.rows;
+  S.defWin = d.default_window;
+  S.wc = d.default_window.center; S.ww = d.default_window.width;
+  S.points = []; S.boxes = []; S.selected = null; S.anns = []; S.maskIndex = 0;
+
+  $('imginfo').textContent = `${d.meta.modality || '?'} · ${S.w}×${S.h} · ${d.frames} frame(s)`;
+  $('frame').max = d.frames - 1; $('frame').value = 0;
+  const span = Math.max(S.ww * 4, 512);
+  $('wc').min = S.wc - span; $('wc').max = S.wc + span; $('wc').step = span / 500; $('wc').value = S.wc;
+  $('ww').min = 1; $('ww').max = span * 2; $('ww').step = span / 500; $('ww').value = S.ww;
+
+  S.zoom = Math.max(1, Math.min(6, Math.floor(520 / Math.max(S.w, S.h)) || 1));
+  for (const el of ['viewctl', 'promptctl', 'listctl']) $(el).hidden = false;
+  $('stack').hidden = false;
+  applyZoom(); refreshFrame(); refreshList();
+  say(`Loaded ${d.filename}. Click the anatomy to segment it.`);
+};
+
+// ---- view -----------------------------------------------------------
+function applyZoom() {
+  const st = $('stack');
+  st.style.width = (S.w * S.zoom) + 'px';
+  st.style.height = (S.h * S.zoom) + 'px';
+  const c = $('marks'); c.width = S.w * S.zoom; c.height = S.h * S.zoom;
+  drawMarks();
+}
+$('zoomin').onclick = () => { S.zoom = Math.min(12, S.zoom + 1); applyZoom(); };
+$('zoomout').onclick = () => { S.zoom = Math.max(1, S.zoom - 1); applyZoom(); };
+
+function refreshFrame() {
+  $('framelbl').textContent = S.frame;
+  $('wclbl').textContent = S.wc.toFixed(0);
+  $('wwlbl').textContent = S.ww.toFixed(0);
+  $('base').src = `/frame.png?image_id=${S.imageId}&frame=${S.frame}&wc=${S.wc}&ww=${S.ww}&_=${Date.now()}`;
+  refreshCommitted();
+  schedulePreview();
+}
+$('frame').oninput = e => {
+  S.frame = +e.target.value; S.points = []; S.boxes = []; S.selected = null;
+  clearPreview(); refreshFrame(); refreshList();
+};
+$('wc').oninput = e => { S.wc = +e.target.value; refreshFrame(); };
+$('ww').oninput = e => { S.ww = +e.target.value; refreshFrame(); };
+$('resetwin').onclick = () => {
+  S.wc = S.defWin.center; S.ww = S.defWin.width;
+  $('wc').value = S.wc; $('ww').value = S.ww; refreshFrame();
+};
+
+// An <img> with no src still paints a broken-image glyph, so layers are hidden
+// rather than merely emptied.
+function setLayer(el, src) {
+  if (src) { el.src = src; el.style.display = ''; }
+  else { el.removeAttribute('src'); el.style.display = 'none'; }
+}
+
+function refreshCommitted() {
+  const has = S.anns.some(a => a.frame === S.frame);
+  setLayer($('committed'), has
+    ? `/annotations/overlay.png?image_id=${S.imageId}&frame=${S.frame}`
+      + (S.selected ? `&selected=${S.selected}` : '') + `&_=${Date.now()}`
+    : null);
+}
+
+// ---- prompt input ---------------------------------------------------
+const marks = $('marks');
+function toNative(ev) {
+  const r = marks.getBoundingClientRect();
+  return {
+    x: Math.max(0, Math.min(S.w - 1, Math.floor((ev.clientX - r.left) / r.width * S.w))),
+    y: Math.max(0, Math.min(S.h - 1, Math.floor((ev.clientY - r.top) / r.height * S.h))),
+  };
+}
+marks.oncontextmenu = e => e.preventDefault();
+marks.onmousedown = e => { if (e.button === 0 && !e.shiftKey) S.drag = { start: toNative(e), moved: false }; };
+marks.onmousemove = e => {
+  if (!S.drag) return;
+  const p = toNative(e);
+  if (Math.abs(p.x - S.drag.start.x) > 2 || Math.abs(p.y - S.drag.start.y) > 2) {
+    S.drag.moved = true; S.drag.cur = p; drawMarks();
+  }
+};
+marks.onmouseup = e => {
+  const p = toNative(e);
+  if (S.drag && S.drag.moved) {
+    const a = S.drag.start;
+    S.boxes.push([Math.min(a.x, p.x), Math.min(a.y, p.y), Math.max(a.x, p.x), Math.max(a.y, p.y)]);
+  } else {
+    S.points.push({ x: p.x, y: p.y, label: (e.button === 2 || e.shiftKey) ? 0 : 1 });
+  }
+  S.drag = null; S.maskIndex = 0; drawMarks(); schedulePreview();
+};
+
+function drawMarks() {
+  const c = marks.getContext('2d'); c.clearRect(0, 0, c.canvas.width, c.canvas.height);
+  const z = S.zoom;
+  c.lineWidth = 2;
+  for (const b of S.boxes) {
+    c.strokeStyle = '#ffffffcc'; c.setLineDash([4, 3]);
+    c.strokeRect(b[0] * z, b[1] * z, (b[2] - b[0]) * z, (b[3] - b[1]) * z);
+  }
+  if (S.drag && S.drag.moved && S.drag.cur) {
+    const a = S.drag.start, p = S.drag.cur;
+    c.strokeStyle = '#ffffff88'; c.setLineDash([4, 3]);
+    c.strokeRect(Math.min(a.x, p.x) * z, Math.min(a.y, p.y) * z,
+                 Math.abs(p.x - a.x) * z, Math.abs(p.y - a.y) * z);
+  }
+  c.setLineDash([]);
+  for (const p of S.points) {
+    const r = Math.max(3, z * 1.6);
+    c.beginPath(); c.arc(p.x * z + z / 2, p.y * z + z / 2, r, 0, 7);
+    c.fillStyle = p.label === 1 ? '#22c55e' : '#ef4444';
+    c.fill(); c.strokeStyle = '#000'; c.lineWidth = 1.5; c.stroke();
+  }
+}
+
+$('clear').onclick = () => {
+  S.points = []; S.boxes = []; S.maskIndex = 0; S.selected = null;
+  clearPreview(); drawMarks(); refreshList(); refreshCommitted();
+  $('editnote').textContent = '';
+};
+$('cycle').onclick = () => { S.maskIndex = (S.maskIndex + 1) % 3; schedulePreview(); };
+
+// ---- live preview ---------------------------------------------------
+let previewTimer = null, previewUrl = null;
+function clearPreview() {
+  setLayer($('preview'), null);
+  if (previewUrl) { URL.revokeObjectURL(previewUrl); previewUrl = null; }
+}
+function schedulePreview() {
+  clearTimeout(previewTimer);
+  previewTimer = setTimeout(runPreview, 60);
+}
+async function runPreview() {
+  if (!S.imageId || (!S.points.length && !S.boxes.length)) { clearPreview(); return; }
+  const body = {
+    image_id: S.imageId, frame: S.frame,
+    prompts: { points: S.points, boxes: S.boxes },
+    window: { center: S.wc, width: S.ww },
+    mask_index: S.maskIndex,
+  };
+  const t0 = performance.now();
+  const r = await fetch('/segment/preview.png', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  if (!r.ok) { clearPreview(); return say('Segment failed: ' + (await r.text()), true); }
+  const blob = await r.blob();
+  if (previewUrl) URL.revokeObjectURL(previewUrl);
+  previewUrl = URL.createObjectURL(blob);
+  setLayer($('preview'), previewUrl);
+  say(`candidate ${S.maskIndex + 1}/${r.headers.get('X-Mask-Candidates')} ·
+       score ${(+r.headers.get('X-Mask-Score')).toFixed(3)} ·
+       ${r.headers.get('X-Mask-Area')} px · ${(performance.now() - t0).toFixed(0)} ms`);
+}
+
+// ---- commit / edit --------------------------------------------------
+$('commit').onclick = async () => {
+  if (S.busy) return;
+  const label = $('label').value.trim();
+  if (!label) return say('Enter a label first.', true);
+  if (!S.points.length && !S.boxes.length) return say('Place at least one prompt.', true);
+
+  S.busy = true;
+  const payload = {
+    prompts: { points: S.points, boxes: S.boxes },
+    window: { center: S.wc, width: S.ww },
+    mask_index: S.maskIndex, label,
+  };
+  let r;
+  if (S.selected) {
+    r = await fetch('/annotations/' + S.selected, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+    });
+  } else {
+    r = await fetch('/annotations', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...payload, image_id: S.imageId, frame: S.frame }),
+    });
+  }
+  S.busy = false;
+  if (!r.ok) return say('Save failed: ' + (await r.text()), true);
+  const a = await r.json();
+
+  S.points = []; S.boxes = []; S.selected = null; S.maskIndex = 0;
+  $('editnote').textContent = '';
+  $('commit').textContent = 'Add mask';
+  clearPreview(); drawMarks();
+  await refreshList();
+  say(`Saved <b>${a.label} #${a.instance}</b> — ${a.area} px.`);
+};
+
+async function refreshList() {
+  if (!S.imageId) return;
+  S.anns = await (await fetch(`/annotations?image_id=${S.imageId}`)).json();
+  $('count').textContent = S.anns.length;
+
+  const seen = new Set();
+  $('labellist').innerHTML = '';
+  for (const a of S.anns) {
+    if (seen.has(a.label)) continue;
+    seen.add(a.label);
+    const o = document.createElement('option'); o.value = a.label; $('labellist').appendChild(o);
+  }
+
+  const list = $('masklist'); list.innerHTML = '';
+  for (const a of S.anns) {
+    const row = document.createElement('div');
+    row.className = 'mask' + (a.id === S.selected ? ' sel' : '');
+    row.innerHTML = `<span class="swatch" style="background:${a.color}"></span>
+      <span class="name">${a.label} <b>#${a.instance}</b></span>
+      <span class="meta">f${a.frame} · ${a.area}px</span>`;
+    const del = document.createElement('button');
+    del.textContent = '✕'; del.className = 'danger'; del.style.padding = '2px 6px';
+    del.onclick = async ev => {
+      ev.stopPropagation();
+      await fetch('/annotations/' + a.id, { method: 'DELETE' });
+      if (S.selected === a.id) { S.selected = null; S.points = []; S.boxes = []; clearPreview(); drawMarks(); }
+      await refreshList(); say('Deleted.');
+    };
+    row.appendChild(del);
+    row.onclick = () => selectMask(a);
+    list.appendChild(row);
+  }
+  refreshCommitted();
+}
+
+function selectMask(a) {
+  S.selected = a.id;
+  if (a.frame !== S.frame) { S.frame = a.frame; $('frame').value = a.frame; }
+  // Load the stored prompts back so the mask can be refined, not redrawn.
+  S.points = (a.prompts.points || []).map(p => ({ x: p.x, y: p.y, label: p.label }));
+  S.boxes = (a.prompts.boxes || []).map(b => b.slice());
+  S.maskIndex = a.mask_index;
+  if (a.window) {
+    S.wc = a.window.center; S.ww = a.window.width;
+    $('wc').value = S.wc; $('ww').value = S.ww;
+  }
+  $('label').value = a.label;
+  $('editnote').innerHTML = `Editing <b>${a.label} #${a.instance}</b> — adjust the prompts, then “Update mask”. Esc cancels.`;
+  $('commit').textContent = 'Update mask';
+  refreshFrame(); refreshList(); drawMarks();
+}
+
+// Deselecting restores create-mode.
+const origClear = $('clear').onclick;
+$('clear').onclick = () => { origClear(); $('commit').textContent = 'Add mask'; };
+
+$('export').onclick = async () => {
+  const r = await fetch(`/export.json?image_id=${S.imageId}`);
+  const blob = new Blob([JSON.stringify(await r.json(), null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `sam2web-${S.imageId.slice(0, 8)}.json`;
+  a.click(); URL.revokeObjectURL(a.href);
+  say('Exported.');
+};
+
+window.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  if (e.key === 'Escape') $('clear').onclick();
+  if (e.key === 'Enter') $('commit').onclick();
+  if (e.key === 'c') $('cycle').onclick();
+  if (e.key === 'ArrowLeft' && S.frame > 0) { $('frame').value = --S.frame; $('frame').oninput({ target: { value: S.frame } }); }
+  if (e.key === 'ArrowRight' && S.frame < S.frames - 1) { $('frame').value = ++S.frame; $('frame').oninput({ target: { value: S.frame } }); }
+});
+</script>
+</body>
+</html>
