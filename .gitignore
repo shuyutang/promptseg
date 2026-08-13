@@ -9,3 +9,8 @@ exports/
 .env
 nohup.out
 samples/
+
+# frontend
+frontend/node_modules/
+frontend/.vite/
+frontend/tsconfig.tsbuildinfo

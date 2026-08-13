@@ -19,6 +19,17 @@ class Window(BaseModel):
     width: float
 
 
+class Stroke(BaseModel):
+    """One brush drag, in native image pixels.
+
+    Strokes are stored alongside the prompts rather than baked into the mask, so
+    the final mask is always `model(prompts)` with these replayed on top.
+    """
+    mode: Literal["add", "erase"] = "add"
+    radius: int = Field(default=6, ge=1, le=256)
+    points: list[list[int]] = Field(default_factory=list)  # [[x, y], ...]
+
+
 class Prompts(BaseModel):
     points: list[Point] = Field(default_factory=list)
     boxes: list[list[int]] = Field(default_factory=list)  # [x1, y1, x2, y2]
@@ -36,6 +47,7 @@ class PreviewRequest(BaseModel):
     threshold: float = settings.default_threshold
     # Candidates are ranked by predicted IoU, so 0 is the best-scoring one.
     mask_index: int = 0
+    strokes: list[Stroke] = Field(default_factory=list)
 
 
 class AnnotationCreate(BaseModel):
@@ -46,6 +58,7 @@ class AnnotationCreate(BaseModel):
     window: Optional[Window] = None
     threshold: float = settings.default_threshold
     mask_index: int = 0
+    strokes: list[Stroke] = Field(default_factory=list)
 
 
 class AnnotationUpdate(BaseModel):
@@ -56,6 +69,8 @@ class AnnotationUpdate(BaseModel):
     window: Optional[Window] = None
     threshold: Optional[float] = None
     mask_index: Optional[int] = None
+    # Replaces the stroke list wholesale -- that is how undo is expressed.
+    strokes: Optional[list[Stroke]] = None
 
 
 class AnnotationOut(BaseModel):
@@ -71,6 +86,11 @@ class AnnotationOut(BaseModel):
     window: Optional[Window]
     threshold: float
     mask_index: int
+    strokes: list[Stroke] = Field(default_factory=list)
     score: Optional[float]
     created_at: str
     updated_at: str
+
+
+class WorkspaceCreate(BaseModel):
+    name: str = ""

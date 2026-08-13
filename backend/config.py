@@ -17,8 +17,11 @@ class Settings:
     # Set SAM2_STUB=1 to run the whole API without downloading weights (CI, laptops).
     stub: bool = os.environ.get("SAM2_STUB", "0") == "1"
 
-    # How many decoded DICOM datasets to keep resident.
-    max_images: int = _env_int("SAM2_MAX_IMAGES", 8)
+    # How many workspaces (folders of images) to keep resident. Eviction is per
+    # workspace, never per image, so a folder cannot lose slices mid-annotation.
+    max_workspaces: int = _env_int("SAM2_MAX_WORKSPACES", 4)
+    # Upper bound on one workspace, so a mis-picked folder cannot exhaust RAM.
+    max_files: int = _env_int("SAM2_MAX_FILES", 500)
     # How many per-frame image embeddings to keep. These are the memory hogs.
     max_embeddings: int = _env_int("SAM2_MAX_EMBEDDINGS", 24)
 

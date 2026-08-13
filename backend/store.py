@@ -8,8 +8,8 @@ from datetime import datetime, timezone
 import numpy as np
 
 from config import settings
-from dicom.io import DicomImage
 from labels import LabelRegistry, canonical
+from media.base import ImageSource
 
 
 def _now() -> str:
@@ -31,6 +31,9 @@ class Annotation:
     area: int
     bbox: list[int] | None
     score: float | None
+    # Hand corrections, replayed on top of the model mask in order. Keeping them
+    # separate from the prompts is what lets a brush fix survive re-prompting.
+    strokes: list[dict] = field(default_factory=list)
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
 
@@ -38,13 +41,16 @@ class Annotation:
 @dataclass
 class ImageRecord:
     image_id: str
-    image: DicomImage
+    source: ImageSource
     filename: str
+    workspace_id: str = ""
+    index: int = 0                      # position in the workspace file list
     labels: LabelRegistry = field(default_factory=LabelRegistry)
     annotations: "OrderedDict[str, Annotation]" = field(default_factory=OrderedDict)
     # canonical label -> highest instance number handed out so far. Never
     # decremented, so instance numbers stay stable when an annotation is deleted.
     _instance_counter: dict[str, int] = field(default_factory=dict)
+    reviewed: bool = False
     created_at: str = field(default_factory=_now)
 
     def next_instance(self, label: str) -> int:
@@ -62,45 +68,149 @@ class ImageRecord:
         return label.strip()
 
     def label_summary(self) -> list[dict]:
-        out: dict[str, dict] = {}
-        for a in self.annotations.values():
+        return _summarise([self])
+
+    def to_listing(self) -> dict:
+        rows, cols = self.source.frame_shape(0)
+        return {
+            "image_id": self.image_id,
+            "filename": self.filename,
+            "index": self.index,
+            "kind": self.source.kind,
+            "frames": self.source.frames,
+            "rows": rows,
+            "columns": cols,
+            "modality": self.source.meta.get("modality", ""),
+            "windowing": self.source.windowing,
+            "annotation_count": len(self.annotations),
+            "labels": sorted({a.label for a in self.annotations.values()}, key=str.lower),
+            "reviewed": self.reviewed,
+        }
+
+
+def _summarise(records: list[ImageRecord]) -> list[dict]:
+    out: dict[str, dict] = {}
+    for rec in records:
+        for a in rec.annotations.values():
             key = canonical(a.label)
-            entry = out.setdefault(key, {"name": a.label, "color": self.labels.color_for(key), "count": 0})
+            entry = out.setdefault(key, {"name": a.label, "color": rec.labels.color_for(key), "count": 0})
             entry["count"] += 1
-        return sorted(out.values(), key=lambda e: e["name"].lower())
+    return sorted(out.values(), key=lambda e: e["name"].lower())
+
+
+@dataclass
+class Workspace:
+    """One folder-load: many files, one shared label vocabulary.
+
+    Colours live here rather than on the image so that 'liver' is the same
+    colour in every file of a folder -- the whole point of labelling a batch.
+    """
+    workspace_id: str
+    name: str = ""
+    labels: LabelRegistry = field(default_factory=LabelRegistry)
+    images: "OrderedDict[str, ImageRecord]" = field(default_factory=OrderedDict)
+    created_at: str = field(default_factory=_now)
+
+    @property
+    def records(self) -> list[ImageRecord]:
+        return list(self.images.values())
+
+    def label_summary(self) -> list[dict]:
+        return _summarise(self.records)
+
+    def to_listing(self) -> dict:
+        return {
+            "workspace_id": self.workspace_id,
+            "name": self.name,
+            "created_at": self.created_at,
+            "image_count": len(self.images),
+            "annotation_count": sum(len(r.annotations) for r in self.images.values()),
+            "labels": self.label_summary(),
+            "images": [r.to_listing() for r in self.images.values()],
+        }
 
 
 class Store:
     """In-memory session state. Bounded so a long-lived server cannot grow forever."""
 
-    def __init__(self, max_images: int | None = None) -> None:
-        self._images: OrderedDict[str, ImageRecord] = OrderedDict()
-        self._max = max_images or settings.max_images
+    def __init__(self, max_workspaces: int | None = None) -> None:
+        self._workspaces: OrderedDict[str, Workspace] = OrderedDict()
+        self._index: dict[str, ImageRecord] = {}     # image_id -> record
+        self._max = max_workspaces or settings.max_workspaces
         self._lock = threading.RLock()
         self.on_evict = None  # set by the app to drop cached embeddings too
 
-    def add(self, image: DicomImage, filename: str) -> ImageRecord:
+    # ---- workspaces ---------------------------------------------------
+
+    def create_workspace(self, name: str = "") -> Workspace:
         with self._lock:
-            image_id = str(uuid.uuid4())
-            rec = ImageRecord(image_id=image_id, image=image, filename=filename)
-            self._images[image_id] = rec
-            self._images.move_to_end(image_id)
-            while len(self._images) > self._max:
-                old_id, _ = self._images.popitem(last=False)
+            ws = Workspace(workspace_id=str(uuid.uuid4()), name=name)
+            self._workspaces[ws.workspace_id] = ws
+            self._evict_locked()
+            return ws
+
+    def get_workspace(self, workspace_id: str) -> Workspace:
+        with self._lock:
+            if workspace_id not in self._workspaces:
+                raise KeyError(workspace_id)
+            self._workspaces.move_to_end(workspace_id)
+            return self._workspaces[workspace_id]
+
+    def workspaces(self) -> list[Workspace]:
+        with self._lock:
+            return list(self._workspaces.values())
+
+    def _evict_locked(self) -> None:
+        while len(self._workspaces) > self._max:
+            _, old = self._workspaces.popitem(last=False)
+            for image_id in old.images:
+                self._index.pop(image_id, None)
                 if self.on_evict:
-                    self.on_evict(old_id)
+                    self.on_evict(image_id)
+
+    # ---- images -------------------------------------------------------
+
+    def add_image(self, ws: Workspace, source: ImageSource, filename: str) -> ImageRecord:
+        with self._lock:
+            if len(ws.images) >= settings.max_files:
+                raise ValueError(
+                    f"Workspace is limited to {settings.max_files} files "
+                    f"(raise SAM2_MAX_FILES to load more)."
+                )
+            rec = ImageRecord(
+                image_id=str(uuid.uuid4()), source=source, filename=filename,
+                workspace_id=ws.workspace_id, index=len(ws.images), labels=ws.labels,
+            )
+            ws.images[rec.image_id] = rec
+            self._index[rec.image_id] = rec
+            self._workspaces.move_to_end(ws.workspace_id)
             return rec
 
     def get(self, image_id: str) -> ImageRecord:
         with self._lock:
-            if image_id not in self._images:
+            rec = self._index.get(image_id)
+            if rec is None:
                 raise KeyError(image_id)
-            self._images.move_to_end(image_id)
-            return self._images[image_id]
+            self._workspaces.move_to_end(rec.workspace_id)
+            return rec
+
+    def delete_image(self, image_id: str) -> bool:
+        with self._lock:
+            rec = self._index.pop(image_id, None)
+            if rec is None:
+                return False
+            ws = self._workspaces.get(rec.workspace_id)
+            if ws:
+                ws.images.pop(image_id, None)
+                for i, r in enumerate(ws.images.values()):
+                    r.index = i
+            if self.on_evict:
+                self.on_evict(image_id)
+            return True
 
     def find_annotation(self, ann_id: str) -> tuple[ImageRecord, Annotation]:
         with self._lock:
-            for rec in self._images.values():
+            for rec in self._index.values():
                 ann = rec.annotations.get(ann_id)
                 if ann is not None:
                     return rec, ann
@@ -110,7 +220,8 @@ class Store:
 
     def add_annotation(self, rec: ImageRecord, *, frame: int, label: str, prompts: dict,
                        window: dict | None, threshold: float, mask_index: int,
-                       mask: np.ndarray, score: float | None) -> Annotation:
+                       mask: np.ndarray, score: float | None,
+                       strokes: list[dict] | None = None) -> Annotation:
         from utils.rle import mask_bbox, mask_to_rle
 
         with self._lock:
@@ -130,6 +241,7 @@ class Store:
                 area=int(mask.sum()),
                 bbox=mask_bbox(mask),
                 score=score,
+                strokes=list(strokes or []),
             )
             rec.annotations[ann.id] = ann
             return ann

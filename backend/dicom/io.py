@@ -1,6 +1,5 @@
 from __future__ import annotations
 import io
-import zipfile
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -55,31 +54,6 @@ def load_single(b: bytes) -> DicomImage:
     return DicomImage("single", [ds], frames, _meta(ds, frames))
 
 
-def load_zip_series(zip_bytes: bytes) -> DicomImage:
-    zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
-    series: list[pydicom.Dataset] = []
-    for name in zf.namelist():
-        if name.endswith("/"):
-            continue
-        try:
-            ds = pydicom.dcmread(io.BytesIO(zf.read(name)), force=True)
-        except Exception:
-            continue
-        if "PixelData" in ds:
-            series.append(ds)
-    if not series:
-        raise ValueError("No readable DICOM images in zip.")
-
-    def zval(d):
-        ipp = getattr(d, "ImagePositionPatient", None)
-        if ipp is not None and len(ipp) == 3:
-            return float(ipp[2])
-        return float(getattr(d, "InstanceNumber", 0) or 0)
-
-    series.sort(key=zval)
-    return DicomImage("series", series, len(series), _meta(series[0], len(series)))
-
-
 def _meta(ds: pydicom.Dataset, frames: int) -> dict:
     """Non-identifying technical metadata, carried into the export for traceability."""
     return {
@@ -115,15 +89,6 @@ def frame_shape(img: DicomImage, frame: int) -> tuple[int, int]:
     """
     ds, _ = dataset_for_frame(img, frame)
     return int(getattr(ds, "Rows", 0) or 0), int(getattr(ds, "Columns", 0) or 0)
-
-
-def frame_shapes(img: DicomImage) -> list[list[int]]:
-    return [list(frame_shape(img, f)) for f in range(img.frames)]
-
-
-def has_uniform_geometry(img: DicomImage) -> bool:
-    shapes = frame_shapes(img)
-    return all(s == shapes[0] for s in shapes)
 
 
 def _raw_frame(img: DicomImage, frame: int) -> np.ndarray:

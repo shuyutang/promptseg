@@ -2,7 +2,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from dicom.io import default_window, frame_rgb, frame_uint8, load_single, load_zip_series
+from dicom.io import default_window, frame_rgb, frame_uint8, load_single
 
 
 def test_loads_each_modality(dicom_bytes):
@@ -60,13 +60,6 @@ def test_windowing_changes_pixels(dicom_bytes):
     assert not np.array_equal(wide, narrow)
     # A narrower window pushes pixels toward the extremes.
     assert narrow.std() >= wide.std()
-
-
-def test_zip_series(series_zip):
-    img = load_zip_series(series_zip)
-    assert img.kind == "series"
-    assert img.frames == 3
-    assert frame_uint8(img, 2).shape == frame_uint8(img, 0).shape
 
 
 def test_model_rgb_matches_display(dicom_bytes):

@@ -23,9 +23,10 @@ def test_upload_reports_geometry(client, dicom_bytes):
     assert "center" in d["default_window"]
 
 
-def test_mixed_size_zip_reports_per_frame_geometry(client, dicom_bytes):
-    """A zipped folder can hold differently-sized images. Reporting one size for
-    the whole study made the viewer map clicks to the wrong coordinates."""
+def test_mixed_size_zip_becomes_one_entry_per_file(client, dicom_bytes):
+    """A zipped folder holds differently-sized images. Each becomes its own file
+    entry with its own geometry -- flattening them into frames of one study made
+    the viewer map clicks to the wrong coordinates."""
     import io
     import zipfile
 
@@ -33,28 +34,27 @@ def test_mixed_size_zip_reports_per_frame_geometry(client, dicom_bytes):
     with zipfile.ZipFile(buf, "w") as zf:
         zf.writestr("a.dcm", dicom_bytes["ct"])   # 128x128
         zf.writestr("b.dcm", dicom_bytes["mr"])   # 64x64
-    r = client.post("/dicom/upload", files={"file": ("folder.zip", buf.getvalue(), "application/zip")})
+    r = client.post("/upload", files=[("files", ("folder.zip", buf.getvalue(), "application/zip"))])
     d = r.json()
 
-    assert d["frames"] == 2
-    assert d["uniform_geometry"] is False
-    shapes = [tuple(s) for s in d["frame_shapes"]]
-    assert len(set(shapes)) == 2, f"expected differing frame sizes, got {shapes}"
+    assert d["added"] == 2 and not d["errors"]
+    shapes = {(i["rows"], i["columns"]) for i in d["images"]}
+    assert shapes == {(128, 128), (64, 64)}
 
-    # Per-frame info must match the actual rendered frame.
-    for f, (rows, cols) in enumerate(shapes):
-        info = client.get(f"/frame_info?image_id={d['image_id']}&frame={f}").json()
-        assert (info["rows"], info["columns"]) == (rows, cols)
-
-    # And the overlay canvas must match the frame, not the first slice.
-    ov = client.get(f"/annotations/overlay.png?image_id={d['image_id']}&frame=1")
-    assert ov.status_code == 200
+    # Per-file info must match the actual rendered image.
+    for item in d["images"]:
+        info = client.get(f"/frame_info?image_id={item['image_id']}&frame=0").json()
+        assert (info["rows"], info["columns"]) == (item["rows"], item["columns"])
+        ov = client.get(f"/annotations/overlay.png?image_id={item['image_id']}&frame=0")
+        assert ov.status_code == 200
 
 
-def test_uniform_series_reports_uniform(client, series_zip):
-    d = client.post("/dicom/upload", files={"file": ("s.zip", series_zip, "application/zip")}).json()
-    assert d["uniform_geometry"] is True
-    assert len(d["frame_shapes"]) == d["frames"]
+def test_multiframe_file_stays_one_entry(client, dicom_bytes):
+    d = client.post("/upload", files=[
+        ("files", ("emri_small.dcm", dicom_bytes["multiframe"], "application/dicom")),
+    ]).json()
+    assert d["added"] == 1
+    assert d["images"][0]["frames"] > 1, "a multi-frame file is one entry with a frame slider"
 
 
 def test_unknown_image_id_is_404(client):
@@ -180,15 +180,17 @@ def test_export_json_roundtrips_masks(client, uploaded):
     _mk(client, iid, "vertebra", 45, 45)
 
     doc = client.get(f"/export.json?image_id={iid}").json()
-    assert doc["schema_version"] == "1.0"
-    assert doc["image"]["image_id"] == iid
-    assert doc["image"]["modality"]
-    assert len(doc["annotations"]) == 2
+    assert doc["schema_version"] == "2.0"
+    assert len(doc["images"]) == 1
+    img = doc["images"][0]
+    assert img["image_id"] == iid
+    assert img["modality"]
+    assert len(img["annotations"]) == 2
 
     labels = {l["name"]: l for l in doc["labels"]}
     assert labels["vertebra"]["count"] == 2
 
-    e = next(x for x in doc["annotations"] if x["id"] == a["id"])
+    e = next(x for x in img["annotations"] if x["id"] == a["id"])
     assert e["label"] == "vertebra" and e["instance"] == 1
     assert e["mask"]["format"] == "coco_rle_uncompressed"
     assert e["prompts"]["points"][0]["x"] == 20
@@ -204,8 +206,9 @@ def test_export_can_omit_masks(client, uploaded):
     iid = uploaded["image_id"]
     _mk(client, iid, "a")
     doc = client.get(f"/export.json?image_id={iid}&include_masks=false").json()
-    assert "mask" not in doc["annotations"][0]
-    assert doc["annotations"][0]["area"] > 0
+    ann = doc["images"][0]["annotations"][0]
+    assert "mask" not in ann
+    assert ann["area"] > 0
 
 
 def test_export_is_json_serialisable_and_stable(client, uploaded):
