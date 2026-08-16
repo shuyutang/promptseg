@@ -1,3 +1,14 @@
+"""Turning an upload into an ordered list of image sources.
+
+Two jobs a folder pick makes necessary. First, deciding what each file is:
+content before extension, because folder exports routinely have no extension at
+all. Second, ordering: naturally by filename, except inside one DICOM series,
+where slice position wins -- exported slices are often named in acquisition
+order, which is not anatomical order.
+
+One unreadable file in a folder of 200 must not fail the batch, so failures are
+collected per file and reported alongside the images that did load.
+"""
 from __future__ import annotations
 import io
 import posixpath
@@ -9,9 +20,10 @@ from media.dicom_source import DicomSource
 from media.raster_source import EXTENSIONS as RASTER_EXTENSIONS, RasterSource
 
 DICOM_EXTENSIONS = {".dcm", ".dicom", ".ima", ".img", ""}
+"""Extensions read as DICOM when the file has no ``DICM`` preamble."""
 
-# Files a folder picker sweeps up that are never images.
 _JUNK = re.compile(r"(^|/)(\.|__MACOSX/|Thumbs\.db$|DICOMDIR$)", re.IGNORECASE)
+"""Files a folder picker sweeps up that are never images."""
 
 
 class LoadError(Exception):
@@ -19,15 +31,45 @@ class LoadError(Exception):
 
 
 def _ext(name: str) -> str:
+    """Get a lowercased extension.
+
+    Args:
+        name: File name or path within the upload.
+
+    Returns:
+        The extension including its dot, or ``""`` if there is none.
+    """
     return posixpath.splitext(name.lower())[1]
 
 
 def looks_like_dicom(data: bytes) -> bool:
+    """Test for the DICOM preamble.
+
+    Args:
+        data: Raw file bytes.
+
+    Returns:
+        True if bytes 128-132 are ``DICM``.
+    """
     return len(data) > 132 and data[128:132] == b"DICM"
 
 
 def load_one(filename: str, data: bytes) -> ImageSource:
-    """Load a single file, choosing the reader by content first, name second."""
+    """Load a single file, choosing the reader by content first, name second.
+
+    Args:
+        filename: Name or path within the upload, used for the extension hint
+            and for error messages.
+        data: Raw file bytes.
+
+    Returns:
+        A :class:`~media.dicom_source.DicomSource` or
+        :class:`~media.raster_source.RasterSource`.
+
+    Raises:
+        LoadError: If the file is empty or no reader can decode it. The message
+            is prefixed with the filename, since it is shown per file.
+    """
     if not data:
         raise LoadError(f"{filename}: empty file")
 
@@ -49,7 +91,15 @@ def load_one(filename: str, data: bytes) -> ImageSource:
 
 
 def _natural(name: str) -> tuple:
-    """img2 before img10, which plain string sorting gets backwards."""
+    """Build a natural sort key: img2 before img10, which string sorting gets backwards.
+
+    Args:
+        name: File name or path; only the basename is used.
+
+    Returns:
+        A tuple of per-token keys, comparable against other keys from this
+        function.
+    """
     base = posixpath.basename(name).lower()
     return tuple(
         (0, int(t), "") if t.isdigit() else (1, 0, t)
@@ -58,8 +108,19 @@ def _natural(name: str) -> tuple:
 
 
 def _series_of(src: ImageSource) -> tuple[str, float | None]:
-    """(series identity, slice position). Position is only meaningful within a
-    series -- sorting two unrelated scans by z would interleave them."""
+    """Get the series identity and slice position of a source.
+
+    Position is only meaningful within a series -- sorting two unrelated scans
+    by z would interleave them.
+
+    Args:
+        src: A loaded file. Non-DICOM sources have no series.
+
+    Returns:
+        ``(series_instance_uid, position)``. Position is the z component of
+        ImagePositionPatient, falling back to InstanceNumber, or None if neither
+        is present.
+    """
     if not isinstance(src, DicomSource):
         return "", None
     ds = src.dataset
@@ -72,8 +133,17 @@ def _series_of(src: ImageSource) -> tuple[str, float | None]:
 
 
 def sort_loaded(items: list[tuple[str, ImageSource]]) -> list[tuple[str, ImageSource]]:
-    """Order a folder the way a reader expects: folders together, each series in
-    slice order, everything else naturally by filename."""
+    """Order a folder the way a reader expects.
+
+    Folders stay together, each series is contiguous and in slice order, and
+    everything else falls back to natural filename order.
+
+    Args:
+        items: ``(name, source)`` pairs in upload order.
+
+    Returns:
+        The same pairs, reordered.
+    """
     rows = []
     for name, src in items:
         uid, z = _series_of(src)
@@ -97,7 +167,18 @@ def sort_loaded(items: list[tuple[str, ImageSource]]) -> list[tuple[str, ImageSo
 
 
 def expand(filename: str, data: bytes) -> list[tuple[str, bytes]]:
-    """A zip becomes its members; anything else stays one file."""
+    """Expand a zip into its members; anything else stays one file.
+
+    Args:
+        filename: Name of the uploaded file.
+        data: Raw file bytes.
+
+    Returns:
+        ``(name, bytes)`` pairs. Directory entries and junk files are dropped.
+
+    Raises:
+        LoadError: If the zip holds no usable members.
+    """
     if _ext(filename) != ".zip":
         return [(filename, data)]
     out: list[tuple[str, bytes]] = []
@@ -112,10 +193,16 @@ def expand(filename: str, data: bytes) -> list[tuple[str, bytes]]:
 
 
 def load_batch(files: list[tuple[str, bytes]]) -> tuple[list[tuple[str, ImageSource]], list[str]]:
-    """Load many uploaded files into (name, source) pairs plus per-file errors.
+    """Load many uploaded files, expanding zips and collecting per-file errors.
 
-    One unreadable file in a folder of 200 must not fail the whole upload, so
-    failures are collected and reported rather than raised.
+    Args:
+        files: ``(name, bytes)`` pairs as uploaded. A picked folder arrives as
+            many pairs whose names carry the path within the folder.
+
+    Returns:
+        ``(loaded, errors)``: the readable files as ``(name, source)`` pairs in
+        display order, and one message per file that failed. Failures are
+        returned rather than raised so one bad file cannot fail the batch.
     """
     loaded: list[tuple[str, ImageSource]] = []
     errors: list[str] = []

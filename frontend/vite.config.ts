@@ -1,3 +1,6 @@
+/**
+ * @fileoverview Vite configuration: where the build lands and how dev proxies the API.
+ */
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 

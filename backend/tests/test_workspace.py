@@ -1,4 +1,9 @@
-"""Folder loading, the file list, and one export for the whole batch."""
+"""Folder loading, the file list, and one export for the whole batch.
+
+The behaviours here are the ones that make a folder workable rather than a pile
+of files: reading order, per-file geometry, a label that keeps its colour
+everywhere, and a single export covering every image.
+"""
 from __future__ import annotations
 import io
 import json
@@ -6,6 +11,19 @@ import zipfile
 
 
 def _mk(client, image_id, label, x=32, y=32, frame=0):
+    """Commit one annotation from a single point prompt.
+
+    Args:
+        client: The test client.
+        image_id: Image to annotate.
+        label: Label to use.
+        x: Point x, in image pixels.
+        y: Point y, in image pixels.
+        frame: Frame index within the image.
+
+    Returns:
+        The created annotation as JSON.
+    """
     r = client.post("/annotations", json={
         "image_id": image_id, "frame": frame, "label": label,
         "prompts": {"points": [{"x": x, "y": y, "label": 1}], "boxes": []},
@@ -15,6 +33,12 @@ def _mk(client, image_id, label, x=32, y=32, frame=0):
 
 
 def test_folder_upload_lists_every_file_by_name(client, folder_files):
+    """A picked folder becomes one named row per image, in natural order.
+
+    Args:
+        client: The test client.
+        folder_files: A picked folder, one part per file.
+    """
     d = client.post("/upload", files=folder_files).json()
 
     names = [i["filename"] for i in d["images"]]
@@ -30,7 +54,12 @@ def test_folder_upload_lists_every_file_by_name(client, folder_files):
 
 def test_a_real_series_sorts_by_slice_position(client, dicom_bytes):
     """Within one series, z wins over the filename -- exported slices are often
-    named in acquisition order, which is not anatomical order."""
+    named in acquisition order, which is not anatomical order.
+
+    Args:
+        client: The test client.
+        dicom_bytes: The DICOM fixtures.
+    """
     import io as _io
     import pydicom
 
@@ -47,6 +76,12 @@ def test_a_real_series_sorts_by_slice_position(client, dicom_bytes):
 
 
 def test_workspace_listing_tracks_progress(client, folder_files):
+    """The listing carries per-file annotation counts, labels and the done flag.
+
+    Args:
+        client: The test client.
+        folder_files: A picked folder, one part per file.
+    """
     d = client.post("/upload", files=folder_files).json()
     wsid = d["workspace_id"]
     first = d["images"][0]["image_id"]
@@ -65,7 +100,12 @@ def test_workspace_listing_tracks_progress(client, folder_files):
 
 def test_one_label_keeps_one_colour_across_the_whole_folder(client, folder_files):
     """The reason colours live on the workspace: 'liver' must look the same in
-    every file, or a batch is unreadable."""
+    every file, or a batch is unreadable.
+
+    Args:
+        client: The test client.
+        folder_files: A picked folder, one part per file.
+    """
     d = client.post("/upload", files=folder_files).json()
     ids = [i["image_id"] for i in d["images"]]
 
@@ -82,6 +122,12 @@ def test_one_label_keeps_one_colour_across_the_whole_folder(client, folder_files
 
 
 def test_export_covers_every_image_in_one_document(client, folder_files):
+    """One document holds the whole folder, empty files included.
+
+    Args:
+        client: The test client.
+        folder_files: A picked folder, one part per file.
+    """
     d = client.post("/upload", files=folder_files).json()
     ids = [i["image_id"] for i in d["images"]]
     _mk(client, ids[0], "liver", 20, 20)
@@ -102,6 +148,12 @@ def test_export_covers_every_image_in_one_document(client, folder_files):
 
 
 def test_export_zip_carries_mask_pngs(client, folder_files):
+    """The zip holds one PNG per mask, at the image's own size.
+
+    Args:
+        client: The test client.
+        folder_files: A picked folder, one part per file.
+    """
     from PIL import Image
 
     d = client.post("/upload", files=folder_files).json()
@@ -130,6 +182,12 @@ def test_export_zip_carries_mask_pngs(client, folder_files):
 
 
 def test_deleting_a_file_renumbers_the_list(client, folder_files):
+    """Removing a file closes the gap in the list and frees its image id.
+
+    Args:
+        client: The test client.
+        folder_files: A picked folder, one part per file.
+    """
     d = client.post("/upload", files=folder_files).json()
     ids = [i["image_id"] for i in d["images"]]
 
@@ -141,6 +199,13 @@ def test_deleting_a_file_renumbers_the_list(client, folder_files):
 
 
 def test_files_can_be_added_to_an_existing_workspace(client, dicom_bytes, folder_files):
+    """A second upload appends to the same workspace instead of starting one.
+
+    Args:
+        client: The test client.
+        dicom_bytes: The DICOM fixtures.
+        folder_files: A picked folder, one part per file.
+    """
     d = client.post("/upload", files=folder_files).json()
     wsid = d["workspace_id"]
 
@@ -153,5 +218,10 @@ def test_files_can_be_added_to_an_existing_workspace(client, dicom_bytes, folder
 
 
 def test_unknown_workspace_is_404(client):
+    """An evicted or invented workspace id is a 404 everywhere it is accepted.
+
+    Args:
+        client: The test client.
+    """
     assert client.get("/workspaces/nope").status_code == 404
     assert client.get("/export.json?workspace_id=nope").status_code == 404

@@ -1,3 +1,10 @@
+"""Ordinary pictures as :class:`~media.base.ImageSource`.
+
+PNG, JPEG, TIFF, BMP, WEBP and GIF, so a user can label a screenshot or an
+exported slice without converting it to DICOM first. 8-bit images are displayed
+as they are; 16-bit and float ones still carry a real intensity range, so they
+keep working window/level controls.
+"""
 from __future__ import annotations
 import io
 
@@ -6,12 +13,11 @@ from PIL import Image, ImageSequence
 
 from media.base import ImageSource
 
-# Ordinary pictures, so a user can label a screenshot or an exported slice
-# without converting it to DICOM first.
 EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".gif"}
+"""Extensions routed to this reader before DICOM is considered."""
 
-# 16-bit PNG/TIFF still carries a real intensity range worth windowing.
 _DEEP_MODES = {"I", "I;16", "I;16B", "I;16L", "F"}
+"""Pillow modes whose pixels are worth windowing rather than showing raw."""
 
 
 class RasterSource(ImageSource):
@@ -20,6 +26,16 @@ class RasterSource(ImageSource):
     kind = "raster"
 
     def __init__(self, data: bytes, filename: str = "") -> None:
+        """Decode every page of a picture file.
+
+        Args:
+            data: Raw file bytes.
+            filename: Original name, kept for error messages only; the format is
+                decided by content.
+
+        Raises:
+            ValueError: If the file decodes to no frames.
+        """
         im = Image.open(io.BytesIO(data))
         self._pages: list[np.ndarray] = []
         for page in ImageSequence.Iterator(im):
@@ -50,6 +66,18 @@ class RasterSource(ImageSource):
 
     @staticmethod
     def _page_array(page: Image.Image) -> np.ndarray:
+        """Convert one Pillow page to an array the rest of the class can use.
+
+        Palette, alpha and bilevel modes are flattened to RGB or grayscale;
+        deep modes are promoted to float32 so windowing has room to work.
+
+        Args:
+            page: One frame from the file.
+
+        Returns:
+            HxW or HxWx3 array, uint8 for ordinary pictures and float32 for
+            16-bit or float ones.
+        """
         if page.mode == "P":
             page = page.convert("RGB")
         elif page.mode == "RGBA":
@@ -68,10 +96,33 @@ class RasterSource(ImageSource):
     # ---- ImageSource -------------------------------------------------
 
     def frame_shape(self, frame: int) -> tuple[int, int]:
+        """Get ``(rows, columns)`` for a page.
+
+        Args:
+            frame: Page index.
+
+        Returns:
+            ``(rows, columns)``.
+
+        Raises:
+            IndexError: If the page index is out of range.
+        """
         a = self._pages[self.check_frame(frame)]
         return int(a.shape[0]), int(a.shape[1])
 
     def default_window(self, frame: int) -> tuple[float, float]:
+        """Get the window the viewer opens with.
+
+        Args:
+            frame: Page index.
+
+        Returns:
+            ``(center, width)``: the full 8-bit range for ordinary pictures, or
+            the 1st-99th percentile span for deep ones.
+
+        Raises:
+            IndexError: If the page index is out of range.
+        """
         a = self._pages[self.check_frame(frame)]
         if a.dtype == np.uint8:
             return 127.5, 255.0
@@ -82,6 +133,19 @@ class RasterSource(ImageSource):
 
     def frame_uint8(self, frame: int, wc: float | None = None,
                     ww: float | None = None) -> np.ndarray:
+        """Render a page for display.
+
+        Args:
+            frame: Page index.
+            wc: Window centre; ignored for 8-bit pictures.
+            ww: Window width; ignored for 8-bit pictures.
+
+        Returns:
+            8-bit HxW grayscale or HxWx3 RGB.
+
+        Raises:
+            IndexError: If the page index is out of range.
+        """
         a = self._pages[self.check_frame(frame)]
         if a.dtype == np.uint8:
             return a  # already displayable; windowing an 8-bit picture only hurts
@@ -93,4 +157,10 @@ class RasterSource(ImageSource):
 
     @property
     def windowing(self) -> bool:
+        """Whether window/level applies.
+
+        Returns:
+            True only for 16-bit or float files, which still have an intensity
+            range to explore.
+        """
         return self._deep

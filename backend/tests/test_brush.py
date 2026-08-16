@@ -1,4 +1,10 @@
-"""Hand-correcting a predicted mask."""
+"""Hand-correcting a predicted mask.
+
+The geometry tests pin down what a stroke means; the API tests pin down the rule
+that makes brushing worth having -- strokes are replayed on top of the model
+output rather than baked in, so a correction survives a later change to the
+prompts.
+"""
 from __future__ import annotations
 
 import numpy as np
@@ -7,9 +13,20 @@ from utils.paint import apply_strokes
 from utils.rle import rle_to_mask
 
 PROMPT = {"points": [{"x": 32, "y": 32, "label": 1}], "boxes": []}
+"""A single include point near the centre of the small fixtures."""
 
 
 def _mk(client, image_id, label="lesion"):
+    """Commit one annotation from :data:`PROMPT`.
+
+    Args:
+        client: The test client.
+        image_id: Image to annotate.
+        label: Label to use.
+
+    Returns:
+        The created annotation as JSON.
+    """
     r = client.post("/annotations", json={
         "image_id": image_id, "frame": 0, "label": label, "prompts": PROMPT})
     assert r.status_code == 200, r.text
@@ -17,6 +34,15 @@ def _mk(client, image_id, label="lesion"):
 
 
 def _area(client, ann_id):
+    """Fetch one mask as a PNG.
+
+    Args:
+        client: The test client.
+        ann_id: Annotation identifier.
+
+    Returns:
+        The response, so callers can check its content type as well as its body.
+    """
     m = client.get(f"/annotations/{ann_id}/mask.png")
     assert m.status_code == 200
     return m
@@ -25,6 +51,7 @@ def _area(client, ann_id):
 # ---- painting ----------------------------------------------------------
 
 def test_a_dab_paints_a_disc():
+    """A single tap paints a disc of exactly the requested radius."""
     m = apply_strokes(np.zeros((50, 50), bool), [{"mode": "add", "radius": 5, "points": [[25, 25]]}])
     assert m[25, 25]
     assert m[25, 30] and not m[25, 31], "radius 5 reaches exactly 5 px"
@@ -40,6 +67,7 @@ def test_a_drag_paints_a_connected_line():
 
 
 def test_erase_removes_and_order_matters():
+    """The eraser takes pixels out, and strokes apply in the order given."""
     full = np.ones((40, 40), bool)
     m = apply_strokes(full, [{"mode": "erase", "radius": 6, "points": [[20, 20]]}])
     assert not m[20, 20] and m[0, 0]
@@ -52,6 +80,7 @@ def test_erase_removes_and_order_matters():
 
 
 def test_strokes_clip_at_the_border():
+    """A stroke at the edge paints what fits instead of raising."""
     m = apply_strokes(np.zeros((30, 30), bool), [{"mode": "add", "radius": 9, "points": [[0, 0], [29, 29]]}])
     assert m[0, 0] and m[29, 29]
 
@@ -59,6 +88,12 @@ def test_strokes_clip_at_the_border():
 # ---- through the API ---------------------------------------------------
 
 def test_brush_adjusts_a_committed_mask(client, uploaded):
+    """Painting grows a committed mask; erasing over it clears that band entirely.
+
+    Args:
+        client: The test client.
+        uploaded: An uploaded MR file.
+    """
     iid = uploaded["image_id"]
     a = _mk(client, iid)
 
@@ -81,6 +116,13 @@ def test_brush_adjusts_a_committed_mask(client, uploaded):
 
 
 def test_undo_is_just_a_shorter_stroke_list(client, uploaded):
+    """Undo is expressed by sending fewer strokes; clearing them all restores
+    the model's own mask.
+
+    Args:
+        client: The test client.
+        uploaded: An uploaded MR file.
+    """
     iid = uploaded["image_id"]
     a = _mk(client, iid)
     s1 = {"mode": "add", "radius": 3, "points": [[5, 5]]}
@@ -96,7 +138,12 @@ def test_undo_is_just_a_shorter_stroke_list(client, uploaded):
 
 def test_hand_edits_survive_a_prompt_change(client, uploaded):
     """Strokes are replayed on top of the model output rather than baked in, so
-    refining the prompts does not throw the correction away."""
+    refining the prompts does not throw the correction away.
+
+    Args:
+        client: The test client.
+        uploaded: An uploaded MR file.
+    """
     iid = uploaded["image_id"]
     a = _mk(client, iid)
     stroke = {"mode": "add", "radius": 4, "points": [[5, 5]]}
@@ -113,12 +160,28 @@ def test_hand_edits_survive_a_prompt_change(client, uploaded):
 
 
 def _rle(client, ann_id):
+    """Read an annotation's stored RLE straight from the store.
+
+    Args:
+        client: The test client, whose app module holds the store.
+        ann_id: Annotation identifier.
+
+    Returns:
+        The stored ``{"counts", "size"}``, so a test can assert on individual
+        pixels rather than on a PNG.
+    """
     import app as app_module
     _, ann = app_module.store.find_annotation(ann_id)
     return ann.rle
 
 
 def test_a_mask_can_be_drawn_with_no_model_prompt_at_all(client, uploaded):
+    """Brush strokes alone make a valid annotation, with no model call and no score.
+
+    Args:
+        client: The test client.
+        uploaded: An uploaded MR file.
+    """
     iid = uploaded["image_id"]
     r = client.post("/annotations", json={
         "image_id": iid, "frame": 0, "label": "manual",
@@ -131,6 +194,12 @@ def test_a_mask_can_be_drawn_with_no_model_prompt_at_all(client, uploaded):
 
 
 def test_empty_prompt_and_no_strokes_is_still_rejected(client, uploaded):
+    """Nothing to act on is a 400, not an empty mask.
+
+    Args:
+        client: The test client.
+        uploaded: An uploaded MR file.
+    """
     r = client.post("/annotations", json={
         "image_id": uploaded["image_id"], "frame": 0, "label": "x",
         "prompts": {"points": [], "boxes": []}})
@@ -138,6 +207,12 @@ def test_empty_prompt_and_no_strokes_is_still_rejected(client, uploaded):
 
 
 def test_preview_shows_the_brush_too(client, uploaded):
+    """The live preview composites strokes, so what is committed is what was seen.
+
+    Args:
+        client: The test client.
+        uploaded: An uploaded MR file.
+    """
     r = client.post("/segment/preview.png", json={
         "image_id": uploaded["image_id"], "frame": 0, "prompts": PROMPT,
         "strokes": [{"mode": "add", "radius": 6, "points": [[5, 5]]}]})
@@ -149,6 +224,12 @@ def test_preview_shows_the_brush_too(client, uploaded):
 
 
 def test_export_records_the_strokes(client, uploaded):
+    """Strokes reach the export, which is what makes an annotation reproducible.
+
+    Args:
+        client: The test client.
+        uploaded: An uploaded MR file.
+    """
     iid = uploaded["image_id"]
     a = _mk(client, iid)
     client.patch(f"/annotations/{a['id']}", json={

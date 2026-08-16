@@ -1,25 +1,41 @@
+/**
+ * @fileoverview The strip above the image: tool, brush size, frame, window/level,
+ * mask visibility and zoom.
+ *
+ * Window and level sit here rather than in a menu because they decide what the
+ * model is given, not just what the screen shows -- they are worth turning
+ * before the first click, not after a bad mask.
+ */
 import type { Tool, Window } from '../types'
 
+/** Props for {@link Toolbar}. */
 type Props = {
+  /** The selected pointer tool. */
   tool: Tool
   setTool: (t: Tool) => void
+  /** Brush and eraser radius, in image pixels. */
   brushRadius: number
   setBrushRadius: (r: number) => void
+  /** Current frame index; the slider only appears for multi-frame files. */
   frame: number
   frames: number
   setFrame: (f: number) => void
+  /** The window in force, or null to use the file's own. */
   win: Window | null
+  /** The file's own window, which also sets the sliders' range. */
   defaultWin: Window | null
   setWin: (w: Window | null) => void
+  /** False for images with no meaningful intensity range; hides the sliders. */
   windowing: boolean
+  /** Zoom on top of fit-to-window, where 1 is a fit. */
   zoom: number
   setZoom: (z: number) => void
-  opacity: number
-  setOpacity: (o: number) => void
+  /** Whether committed masks and the preview are drawn at all. */
   showMasks: boolean
   setShowMasks: (v: boolean) => void
 }
 
+/** The tools, in shortcut order; the keys match the global handler in App. */
 const TOOLS: { id: Tool; label: string; key: string; hint: string }[] = [
   { id: 'include', label: '＋ Point', key: '1', hint: 'Click what you want (right-click always excludes)' },
   { id: 'exclude', label: '－ Point', key: '2', hint: 'Click what to leave out' },
@@ -28,6 +44,12 @@ const TOOLS: { id: Tool; label: string; key: string; hint: string }[] = [
   { id: 'eraser', label: '⌫ Erase', key: '5', hint: 'Paint pixels out of the mask' },
 ]
 
+/**
+ * Renders the toolbar.
+ *
+ * @param p Component props.
+ * @return The strip, with controls that do not apply to the open file omitted.
+ */
 export default function Toolbar(p: Props) {
   const painting = p.tool === 'brush' || p.tool === 'eraser'
   return (
@@ -91,12 +113,10 @@ export default function Toolbar(p: Props) {
         </>
       )}
 
-      <label className="ctl" title="Mask opacity">
+      <label className="ctl" title="Show the masks drawn on this frame">
         <input type="checkbox" checked={p.showMasks}
                onChange={(e) => p.setShowMasks(e.currentTarget.checked)} />
         Masks
-        <input type="range" min={0} max={255} value={p.opacity} disabled={!p.showMasks}
-               onChange={(e) => p.setOpacity(Number(e.currentTarget.value))} />
       </label>
 
       <div className="zoom">

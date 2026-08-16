@@ -1,3 +1,13 @@
+"""FastAPI application: routes, request plumbing and the export document.
+
+Endpoint docstrings are also what FastAPI publishes at ``/docs``, so they are
+written to be read there; ``docs/api.md`` lists the same routes in one table.
+
+Two things happen at import time and are worth knowing about. The model is
+constructed here, so the first server start blocks until the weights are
+downloaded and loaded. And the store's eviction hook is wired to the runner, so
+dropping a workspace also frees the embeddings its images were holding.
+"""
 from __future__ import annotations
 import io
 import posixpath
@@ -28,13 +38,15 @@ from utils.images import array_to_png, mask_to_png, overlay_png
 from utils.paint import apply_strokes
 from utils.rle import rle_to_mask
 
-app = FastAPI(title="sam2web -- DICOM & image segmentation")
+app = FastAPI(title="promptseg -- DICOM & image segmentation")
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
 
 STATIC = Path(__file__).parent / "static"
+"""Where the built frontend lives. Committed, so a fresh clone runs without Node."""
+
 store = Store()
 runner = Sam2Runner()
 store.on_evict = runner.drop_image
@@ -43,6 +55,17 @@ store.on_evict = runner.drop_image
 # ---- helpers ----------------------------------------------------------
 
 def _rec(image_id: str) -> ImageRecord:
+    """Look up an image, or fail the request.
+
+    Args:
+        image_id: Image identifier from the client.
+
+    Returns:
+        The record.
+
+    Raises:
+        HTTPException: 404 if it is unknown or its workspace was evicted.
+    """
     try:
         return store.get(image_id)
     except KeyError:
@@ -50,6 +73,17 @@ def _rec(image_id: str) -> ImageRecord:
 
 
 def _ws(workspace_id: str) -> Workspace:
+    """Look up a workspace, or fail the request.
+
+    Args:
+        workspace_id: Workspace identifier from the client.
+
+    Returns:
+        The workspace.
+
+    Raises:
+        HTTPException: 404 if it is unknown or was evicted.
+    """
     try:
         return store.get_workspace(workspace_id)
     except KeyError:
@@ -57,19 +91,50 @@ def _ws(workspace_id: str) -> Workspace:
 
 
 def _win(rec: ImageRecord, frame: int, window: Optional[Window]) -> tuple[float, float]:
+    """Resolve the window a request should be rendered under.
+
+    Args:
+        rec: The image.
+        frame: Frame index.
+        window: Explicit window, or None to use the file's default.
+
+    Returns:
+        ``(center, width)``.
+    """
     if window is not None:
         return float(window.center), float(window.width)
     return rec.source.default_window(frame)
 
 
 def _embed_key(image_id: str, frame: int, wc: float, ww: float) -> str:
-    # Windowing changes the pixels handed to the encoder, so it has to be part
-    # of the cache key -- otherwise re-windowing would silently reuse stale
-    # embeddings computed from a different-looking image.
+    """Build the embedding cache key.
+
+    Windowing changes the pixels handed to the encoder, so it has to be part of
+    the key -- otherwise re-windowing would silently reuse stale embeddings
+    computed from a different-looking image.
+
+    Args:
+        image_id: Image identifier.
+        frame: Frame index.
+        wc: Window centre.
+        ww: Window width.
+
+    Returns:
+        A key of the form ``image_id:frame:center:width``, window values rounded
+        to 2 decimals so slider jitter does not miss the cache.
+    """
     return f"{image_id}:{frame}:{round(wc, 2)}:{round(ww, 2)}"
 
 
 def _prompts_dict(prompts) -> dict:
+    """Flatten API prompts into what the runner expects.
+
+    Args:
+        prompts: A :class:`schemas.Prompts`.
+
+    Returns:
+        ``{"points": [[x, y, label]], "boxes": [[x1, y1, x2, y2]]}``.
+    """
     return {
         "points": [[p.x, p.y, p.label] for p in prompts.points],
         "boxes": [list(map(int, b)) for b in prompts.boxes],
@@ -78,6 +143,14 @@ def _prompts_dict(prompts) -> dict:
 
 @dataclass
 class RunResult:
+    """The outcome of one segmentation request.
+
+    Attributes:
+        mask: HxW binary mask, strokes already replayed.
+        score: Predicted IoU, or None when no model call was made.
+        num_candidates: How many candidates the model offered; 0 for a purely
+            hand-drawn mask.
+    """
     mask: np.ndarray
     score: float | None
     num_candidates: int
@@ -86,6 +159,27 @@ class RunResult:
 def _run(rec: ImageRecord, frame: int, prompts, window: Optional[Window],
          threshold: float, mask_index: int,
          strokes: Optional[list[Stroke]] = None) -> RunResult:
+    """Produce a mask: segment if there are prompts, then replay the strokes.
+
+    This is the one place a mask is composed, shared by preview, create and
+    update so all three agree on what a given request means.
+
+    Args:
+        rec: The image.
+        frame: Frame index within it.
+        prompts: A :class:`schemas.Prompts`. May be empty if strokes are given.
+        window: Display window, or None for the file's default.
+        threshold: Foreground probability threshold.
+        mask_index: Which ranked candidate to take.
+        strokes: Brush strokes to replay on top of the model output.
+
+    Returns:
+        RunResult: The composed mask and what produced it.
+
+    Raises:
+        HTTPException: 400 if there is nothing to act on, if the frame index is
+            out of range, or if the runner rejects the prompts.
+    """
     strokes = list(strokes or [])
     if prompts.is_empty() and not strokes:
         raise HTTPException(400, "At least one point, box, or brush stroke is required.")
@@ -114,6 +208,16 @@ def _run(rec: ImageRecord, frame: int, prompts, window: Optional[Window],
 
 
 def _out(rec: ImageRecord, ann: Annotation) -> AnnotationOut:
+    """Render a stored annotation as the API response model.
+
+    Args:
+        rec: The image it belongs to, consulted for the label's colour.
+        ann: The stored annotation.
+
+    Returns:
+        AnnotationOut: Everything except the mask pixels, which the client
+        fetches as PNG.
+    """
     return AnnotationOut(
         id=ann.id, image_id=ann.image_id, frame=ann.frame, label=ann.label,
         instance=ann.instance, color=rec.labels.color_for(ann.label),
@@ -133,6 +237,15 @@ if (STATIC / "assets").is_dir():
 
 @app.get("/")
 def index():
+    """Serve the built frontend.
+
+    Returns:
+        FileResponse: ``static/index.html``, uncached so a rebuilt UI shows up
+        on reload.
+
+    Raises:
+        HTTPException: 503 if the frontend has not been built.
+    """
     page = STATIC / "index.html"
     if not page.exists():
         raise HTTPException(
@@ -143,6 +256,13 @@ def index():
 
 @app.get("/health")
 def health():
+    """Report what actually came up.
+
+    Returns:
+        The model id (or ``"stub"``), the device in use, how many embeddings are
+        cached and how many workspaces are resident. Checking ``device`` is the
+        quickest way to catch a CPU-only torch on a CUDA box.
+    """
     return {
         "ok": True,
         "model": "stub" if runner.stub else runner.model_id,
@@ -156,11 +276,24 @@ def health():
 
 @app.post("/workspaces")
 def create_workspace(req: WorkspaceCreate = WorkspaceCreate()):
+    """Create an empty workspace to upload into.
+
+    Args:
+        req: Carries the display name.
+
+    Returns:
+        The new workspace's listing.
+    """
     return store.create_workspace(req.name).to_listing()
 
 
 @app.get("/workspaces")
 def list_workspaces():
+    """List resident workspaces.
+
+    Returns:
+        One entry per workspace with its id, name, file count and creation time.
+    """
     return [{"workspace_id": w.workspace_id, "name": w.name,
              "image_count": len(w.images), "created_at": w.created_at}
             for w in store.workspaces()]
@@ -168,6 +301,17 @@ def list_workspaces():
 
 @app.get("/workspaces/{workspace_id}")
 def get_workspace(workspace_id: str):
+    """Get one workspace: its file list, label summary and progress.
+
+    Args:
+        workspace_id: Workspace identifier.
+
+    Returns:
+        The workspace listing, including a row per image.
+
+    Raises:
+        HTTPException: 404 if the workspace is unknown or was evicted.
+    """
     return _ws(workspace_id).to_listing()
 
 
@@ -175,8 +319,26 @@ def get_workspace(workspace_id: str):
 async def upload(files: list[UploadFile] = File(...),
                  workspace_id: Optional[str] = Form(None),
                  name: Optional[str] = Form(None)):
-    """Add files to a workspace. A folder pick arrives here as many parts, and a
-    .zip is expanded into its members -- one list entry per image either way."""
+    """Add files to a workspace.
+
+    A folder pick arrives here as many parts, and a .zip is expanded into its
+    members -- one list entry per image either way. Unreadable files are
+    reported rather than failing the batch.
+
+    Args:
+        files: Uploaded parts. Each filename carries its path within the folder,
+            which is what the file list and the export show.
+        workspace_id: Workspace to append to. Omit to start a new one.
+        name: Display name for a new workspace; defaults to the folder's name.
+
+    Returns:
+        The workspace id, how many files were added, per-file errors, the rows
+        that were added and the full workspace listing.
+
+    Raises:
+        HTTPException: 400 if nothing was uploaded or nothing was readable; 404
+            if ``workspace_id`` is unknown.
+    """
     payloads = [((f.filename or "upload").strip(), await f.read()) for f in files]
     if not payloads:
         raise HTTPException(400, "No files uploaded.")
@@ -205,7 +367,21 @@ async def upload(files: list[UploadFile] = File(...),
 @app.post("/dicom/upload")
 async def upload_single(file: UploadFile = File(...),
                         workspace_id: Optional[str] = Form(None)):
-    """Single-file upload. Kept because it is the smallest possible client."""
+    """Upload one file. Kept because it is the smallest possible client.
+
+    Args:
+        file: The uploaded file. A .zip is still expanded, so this can produce
+            several images.
+        workspace_id: Workspace to append to. Omit to start a new one.
+
+    Returns:
+        The first image's identity, geometry, metadata and default window, plus
+        a listing for everything that loaded.
+
+    Raises:
+        HTTPException: 400 if the file could not be read; 404 if
+            ``workspace_id`` is unknown.
+    """
     raw = await file.read()
     name = (file.filename or "upload").strip()
     loaded, errors = load_batch([(name, raw)])
@@ -230,11 +406,28 @@ async def upload_single(file: UploadFile = File(...),
 
 
 class ImagePatch(BaseModel):
+    """Fields that can be changed on an image.
+
+    Attributes:
+        reviewed: Whether the user has marked this file done.
+    """
     reviewed: Optional[bool] = None
 
 
 @app.patch("/images/{image_id}")
 def patch_image(image_id: str, req: ImagePatch):
+    """Mark a file done, or not done.
+
+    Args:
+        image_id: Image identifier.
+        req: The fields to change; unset ones are left alone.
+
+    Returns:
+        The image's updated listing row.
+
+    Raises:
+        HTTPException: 404 if the image is unknown or was evicted.
+    """
     rec = _rec(image_id)
     if req.reviewed is not None:
         rec.reviewed = bool(req.reviewed)
@@ -243,6 +436,17 @@ def patch_image(image_id: str, req: ImagePatch):
 
 @app.delete("/images/{image_id}")
 def delete_image(image_id: str):
+    """Drop a file from its workspace, freeing its cached embeddings.
+
+    Args:
+        image_id: Image identifier.
+
+    Returns:
+        The deleted id.
+
+    Raises:
+        HTTPException: 404 if the image is unknown.
+    """
     if not store.delete_image(image_id):
         raise HTTPException(404, f"Unknown image_id {image_id!r}")
     return {"deleted": image_id}
@@ -250,6 +454,23 @@ def delete_image(image_id: str):
 
 @app.get("/frame_info")
 def frame_info(image_id: str = Query(...), frame: int = Query(0)):
+    """Get one frame's geometry and default window.
+
+    Geometry is per image, so the client asks per file rather than assuming one
+    size for the folder.
+
+    Args:
+        image_id: Image identifier.
+        frame: Frame index within it.
+
+    Returns:
+        Rows and columns, whether window/level applies, and the window the
+        viewer should open with.
+
+    Raises:
+        HTTPException: 400 if the frame index is out of range; 404 if the image
+            is unknown.
+    """
     rec = _rec(image_id)
     try:
         rows, cols = rec.source.frame_shape(frame)
@@ -264,6 +485,24 @@ def frame_info(image_id: str = Query(...), frame: int = Query(0)):
 @app.get("/frame.png")
 def frame_png(image_id: str = Query(...), frame: int = Query(0),
               wc: Optional[float] = None, ww: Optional[float] = None):
+    """Render a frame for display.
+
+    These are the exact pixels the model is given, which is what makes a click
+    mean the same thing to the user and to SAM.
+
+    Args:
+        image_id: Image identifier.
+        frame: Frame index within it.
+        wc: Window centre. Omit both this and ``ww`` for the file's own window.
+        ww: Window width.
+
+    Returns:
+        Response: An 8-bit PNG, uncached because the window can change.
+
+    Raises:
+        HTTPException: 400 if the frame index is out of range; 404 if the image
+            is unknown.
+    """
     rec = _rec(image_id)
     try:
         arr = rec.source.frame_uint8(frame, wc, ww)
@@ -277,7 +516,26 @@ def frame_png(image_id: str = Query(...), frame: int = Query(0),
 
 @app.post("/segment/preview.png")
 def preview_png(req: PreviewRequest, color: str = Query("#E8453C"), alpha: int = Query(110)):
-    """Uncommitted mask for the prompts currently being placed."""
+    """Segment for the prompts currently being placed, without committing.
+
+    This is the request behind the ~10 ms click: on a cached embedding only the
+    mask decoder runs.
+
+    Args:
+        req: Image, frame, prompts, window, threshold, candidate index and any
+            brush strokes.
+        color: Hex fill colour for the overlay.
+        alpha: Fill opacity, 0-255.
+
+    Returns:
+        Response: An RGBA PNG overlay. The mask's score, pixel area and
+        candidate count come back in the ``X-Mask-Score``, ``X-Mask-Area`` and
+        ``X-Mask-Candidates`` headers, so the UI needs no second request.
+
+    Raises:
+        HTTPException: 400 if there is nothing to act on or the frame index is
+            out of range; 404 if the image is unknown.
+    """
     rec = _rec(req.image_id)
     res = _run(rec, req.frame, req.prompts, req.window, req.threshold,
                req.mask_index, req.strokes)
@@ -294,6 +552,24 @@ def preview_png(req: PreviewRequest, color: str = Query("#E8453C"), alpha: int =
 
 @app.post("/annotations", response_model=AnnotationOut)
 def create_annotation(req: AnnotationCreate):
+    """Commit the current mask as a labelled instance.
+
+    Reusing a label adds another instance in the same colour; the colour lives
+    on the workspace, so it is the same in every file of the folder.
+
+    Args:
+        req: Image, frame, label, prompts, window, threshold, candidate index
+            and any brush strokes.
+
+    Returns:
+        AnnotationOut: The stored annotation, including its instance number and
+        colour.
+
+    Raises:
+        HTTPException: 400 if the label is empty or the request has nothing to
+            act on; 404 if the image is unknown; 422 if the prompts produce an
+            empty mask.
+    """
     rec = _rec(req.image_id)
     if not req.label.strip():
         raise HTTPException(400, "label must not be empty.")
@@ -314,6 +590,18 @@ def create_annotation(req: AnnotationCreate):
 
 @app.get("/annotations", response_model=list[AnnotationOut])
 def list_annotations(image_id: str = Query(...), frame: Optional[int] = None):
+    """List an image's annotations.
+
+    Args:
+        image_id: Image identifier.
+        frame: Restrict to one frame. Omit for every frame of the file.
+
+    Returns:
+        list[AnnotationOut]: In creation order.
+
+    Raises:
+        HTTPException: 404 if the image is unknown.
+    """
     rec = _rec(image_id)
     anns = [a for a in rec.annotations.values() if frame is None or a.frame == frame]
     return [_out(rec, a) for a in anns]
@@ -321,6 +609,23 @@ def list_annotations(image_id: str = Query(...), frame: Optional[int] = None):
 
 @app.patch("/annotations/{ann_id}", response_model=AnnotationOut)
 def update_annotation(ann_id: str, req: AnnotationUpdate):
+    """Edit an annotation: its prompts, strokes, label, window or threshold.
+
+    The mask is only recomputed if something that shapes it actually changed,
+    and the recompute reuses the cached image embedding. Passing ``strokes``
+    replaces the list wholesale, which is how undo is expressed.
+
+    Args:
+        ann_id: Annotation identifier.
+        req: The fields to change; unset ones are left alone.
+
+    Returns:
+        AnnotationOut: The updated annotation.
+
+    Raises:
+        HTTPException: 404 if the annotation is unknown; 422 if the edit
+            produces an empty mask, in which case the previous mask is kept.
+    """
     try:
         rec, ann = store.find_annotation(ann_id)
     except KeyError:
@@ -356,6 +661,17 @@ def update_annotation(ann_id: str, req: AnnotationUpdate):
 
 @app.delete("/annotations/{ann_id}")
 def delete_annotation(ann_id: str):
+    """Delete one annotation.
+
+    Args:
+        ann_id: Annotation identifier.
+
+    Returns:
+        The deleted id.
+
+    Raises:
+        HTTPException: 404 if the annotation is unknown.
+    """
     try:
         rec, _ = store.find_annotation(ann_id)
     except KeyError:
@@ -368,10 +684,24 @@ def delete_annotation(ann_id: str):
 def annotations_overlay(image_id: str = Query(...), frame: int = Query(0),
                         selected: Optional[str] = None, exclude: Optional[str] = None,
                         alpha: int = Query(110)):
-    """All committed masks on this frame, composited with per-label colours.
+    """Composite every committed mask on a frame, in per-label colours.
 
-    `exclude` drops one annotation: while it is being edited its live preview is
-    drawn instead, and showing both would leave the old mask peeking out."""
+    Args:
+        image_id: Image identifier.
+        frame: Frame index within it.
+        selected: Draw this annotation with a thicker white outline.
+        exclude: Drop one annotation: while it is being edited its live preview
+            is drawn instead, and showing both would leave the old mask peeking
+            out.
+        alpha: Fill opacity, 0-255.
+
+    Returns:
+        Response: An RGBA PNG, uncached because it changes on every edit.
+
+    Raises:
+        HTTPException: 400 if the frame index is out of range; 404 if the image
+            is unknown.
+    """
     rec = _rec(image_id)
     try:
         h, w = rec.source.frame_shape(frame)
@@ -394,6 +724,17 @@ def annotations_overlay(image_id: str = Query(...), frame: int = Query(0),
 
 @app.get("/annotations/{ann_id}/mask.png")
 def annotation_mask_png(ann_id: str):
+    """Get one mask on its own.
+
+    Args:
+        ann_id: Annotation identifier.
+
+    Returns:
+        Response: An 8-bit PNG whose pixels are 0 or 255.
+
+    Raises:
+        HTTPException: 404 if the annotation is unknown.
+    """
     try:
         _, ann = store.find_annotation(ann_id)
     except KeyError:
@@ -403,6 +744,19 @@ def annotation_mask_png(ann_id: str):
 
 @app.get("/labels")
 def labels(image_id: Optional[str] = None, workspace_id: Optional[str] = None):
+    """Get the label vocabulary and its colours.
+
+    Args:
+        image_id: Summarise one file.
+        workspace_id: Summarise the whole folder. Takes precedence.
+
+    Returns:
+        ``{"labels": [{"name", "color", "count"}]}``, sorted by name.
+
+    Raises:
+        HTTPException: 400 if neither argument was given; 404 if the image or
+            workspace is unknown.
+    """
     if workspace_id:
         return {"labels": _ws(workspace_id).label_summary()}
     if image_id:
@@ -413,6 +767,19 @@ def labels(image_id: Optional[str] = None, workspace_id: Optional[str] = None):
 # ---- export ------------------------------------------------------------
 
 def _records(image_id: Optional[str], workspace_id: Optional[str]) -> tuple[Workspace, list[ImageRecord]]:
+    """Resolve what an export request covers.
+
+    Args:
+        image_id: Export one file.
+        workspace_id: Export the whole folder. Takes precedence.
+
+    Returns:
+        ``(workspace, records)``.
+
+    Raises:
+        HTTPException: 400 if neither argument was given; 404 if either is
+            unknown.
+    """
     if workspace_id:
         ws = _ws(workspace_id)
         return ws, ws.records
@@ -423,6 +790,19 @@ def _records(image_id: Optional[str], workspace_id: Optional[str]) -> tuple[Work
 
 
 def _ann_dict(rec: ImageRecord, a: Annotation, include_masks: bool) -> dict:
+    """Render one annotation for the export.
+
+    Args:
+        rec: The image it belongs to, consulted for the label's colour.
+        a: The annotation.
+        include_masks: Whether to embed the RLE mask. False gives a
+            metadata-only export.
+
+    Returns:
+        The annotation's export entry. Prompts, strokes, window, threshold and
+        candidate index are always present, so the mask can be re-derived rather
+        than only read.
+    """
     return {
         "id": a.id,
         "label": a.label,
@@ -446,6 +826,16 @@ def _ann_dict(rec: ImageRecord, a: Annotation, include_masks: bool) -> dict:
 
 
 def _image_dict(rec: ImageRecord, include_masks: bool) -> dict:
+    """Render one image for the export.
+
+    Args:
+        rec: The image.
+        include_masks: Whether to embed RLE masks.
+
+    Returns:
+        Identity, geometry and metadata, plus the annotations sorted by frame,
+        label and instance.
+    """
     anns = sorted(rec.annotations.values(), key=lambda a: (a.frame, canonical(a.label), a.instance))
     return {
         "image_id": rec.image_id,
@@ -460,11 +850,24 @@ def _image_dict(rec: ImageRecord, include_masks: bool) -> dict:
 
 
 def _export_doc(ws: Workspace, records: list[ImageRecord], include_masks: bool) -> dict:
+    """Build the schema 2.0 export document.
+
+    Every image appears, including ones with no annotations -- the export
+    records what was looked at and found empty, not only what was marked.
+
+    Args:
+        ws: The workspace being exported.
+        records: The images to include.
+        include_masks: Whether to embed RLE masks.
+
+    Returns:
+        The document, described in ``docs/api.md``.
+    """
     from store import _summarise
 
     return {
         "schema_version": "2.0",
-        "generator": "sam2web",
+        "generator": "promptseg",
         "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "model": {
             "id": "stub" if runner.stub else runner.model_id,
@@ -485,20 +888,57 @@ def _export_doc(ws: Workspace, records: list[ImageRecord], include_masks: bool) 
 @app.get("/export.json")
 def export_json(image_id: Optional[str] = None, workspace_id: Optional[str] = None,
                 include_masks: bool = Query(True)):
-    """Every annotation in the workspace, in one document -- the whole point of
-    labelling a folder is not having to export file by file."""
+    """Export every annotation in one document.
+
+    The whole point of labelling a folder is not having to export file by file.
+
+    Args:
+        image_id: Export one file.
+        workspace_id: Export the whole folder. Takes precedence.
+        include_masks: Set false for a metadata-only export.
+
+    Returns:
+        The schema 2.0 document; masks are column-major COCO uncompressed RLE.
+
+    Raises:
+        HTTPException: 400 if neither identifier was given; 404 if either is
+            unknown.
+    """
     ws, records = _records(image_id, workspace_id)
     return _export_doc(ws, records, include_masks)
 
 
 def _safe(name: str) -> str:
+    """Make a filename safe to write into a zip.
+
+    Args:
+        name: A filename or label, possibly holding a path or punctuation.
+
+    Returns:
+        The basename with anything outside ``A-Za-z0-9._-`` replaced by
+        underscores, never empty.
+    """
     stem = posixpath.basename(name) or "image"
     return re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._") or "image"
 
 
 @app.get("/export.zip")
 def export_zip(image_id: Optional[str] = None, workspace_id: Optional[str] = None):
-    """annotations.json plus one PNG per mask, for tools that want pixels."""
+    """Export annotations.json plus one PNG per mask, for tools that want pixels.
+
+    Args:
+        image_id: Export one file.
+        workspace_id: Export the whole folder. Takes precedence.
+
+    Returns:
+        Response: A zip holding ``annotations.json`` and
+        ``masks/<index>_<file>/f<frame>_<label>_<instance>.png``, offered as a
+        timestamped download.
+
+    Raises:
+        HTTPException: 400 if neither identifier was given; 404 if either is
+            unknown.
+    """
     import json
 
     ws, records = _records(image_id, workspace_id)
@@ -515,5 +955,5 @@ def export_zip(image_id: Optional[str] = None, workspace_id: Optional[str] = Non
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     return Response(buf.getvalue(), media_type="application/zip", headers={
-        "Content-Disposition": f'attachment; filename="sam2web-{stamp}.zip"',
+        "Content-Disposition": f'attachment; filename="promptseg-{stamp}.zip"',
     })

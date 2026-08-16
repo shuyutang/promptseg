@@ -1,3 +1,10 @@
+/*
+ * Styling for the whole app: a dark, three-column shell.
+ *
+ * Dark on purpose -- a bright chrome around a grayscale scan changes how the
+ * scan itself reads. Colours are declared once as custom properties on :root;
+ * mask colours are not among them, since those come from the server per label.
+ */
 :root {
   --bg: #0b0d12;
   --panel: #12151d;
@@ -65,6 +72,9 @@ input[type="range"] { accent-color: var(--accent); width: 100%; }
 .panel-head h1 { font-size: 15px; margin: 0; letter-spacing: .3px; }
 .panel-head h2 { font-size: 12px; margin: 0; text-transform: uppercase; letter-spacing: .8px; color: var(--muted); }
 .panel-foot { border-top: 1px solid var(--line); padding-top: 8px; display: flex; flex-direction: column; gap: 8px; }
+/* Export buttons say what they produce, so their labels are allowed to wrap
+   inside the narrow panel rather than being clipped. */
+.panel-foot > button { white-space: normal; line-height: 1.35; }
 
 .row { display: flex; align-items: center; }
 .row.gap { gap: 6px; }

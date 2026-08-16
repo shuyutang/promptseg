@@ -1,3 +1,6 @@
+/**
+ * @fileoverview Entry point: mounts the app and pulls in the stylesheet.
+ */
 import { createRoot } from 'react-dom/client'
 import App from './App'
 import './styles.css'

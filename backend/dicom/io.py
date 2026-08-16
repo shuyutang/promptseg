@@ -1,3 +1,15 @@
+"""DICOM pixel decoding, windowing and display rendering.
+
+The chain from stored bytes to a displayable frame has several places where a
+naive read shows the wrong image: palette colour stores indices rather than
+intensities, MONOCHROME1 stores an inverted scale, and a multi-frame file's
+pixel array has to be indexed before anything else happens. This module owns all
+of it, so the rest of the app only ever sees 8-bit pixels.
+
+The frame it produces is both what the browser draws and what the model is
+given, which is what makes a click at (x, y) mean the same thing to the user and
+to SAM.
+"""
 from __future__ import annotations
 import io
 from dataclasses import dataclass, field
@@ -14,24 +26,51 @@ except ImportError:  # pragma: no cover - pydicom 2.x
 
 @dataclass
 class DicomImage:
-    """A loaded study: either one file (possibly multi-frame) or a sorted series."""
+    """A loaded study: either one file (possibly multi-frame) or a sorted series.
+
+    Attributes:
+        kind: ``"single"`` for one file, ``"series"`` for one dataset per frame.
+        datasets: The parsed pydicom datasets.
+        frames: Total frames addressable through this image.
+        meta: Non-identifying technical metadata, from :func:`_meta`.
+        _cache: Frame index to post-modality-LUT array. Decoding is expensive
+            for compressed transfer syntaxes, and windowing is re-applied on
+            top, so decoded frames are kept.
+    """
     kind: str                       # "single" | "series"
     datasets: list[pydicom.Dataset]
     frames: int
     meta: dict
-    # frame index -> post-modality-LUT float array (decode is expensive for
-    # compressed transfer syntaxes, and windowing is re-applied on top)
     _cache: dict[int, np.ndarray] = field(default_factory=dict)
 
 
 def _is_color(ds: pydicom.Dataset, arr: np.ndarray) -> bool:
+    """Decide whether a decoded frame is colour.
+
+    Args:
+        ds: The dataset the frame came from.
+        arr: The decoded pixel array.
+
+    Returns:
+        True for RGB/YBR data or three samples per pixel.
+    """
     spp = int(getattr(ds, "SamplesPerPixel", 1) or 1)
     photo = str(getattr(ds, "PhotometricInterpretation", "MONOCHROME2") or "")
     return spp == 3 or (arr.ndim == 3 and arr.shape[-1] == 3) or photo.upper().startswith(("RGB", "YBR"))
 
 
 def _first(value, default=None) -> float | None:
-    """WindowCenter/Width may be single-valued or a MultiValue."""
+    """Read a tag that may be single-valued or a MultiValue.
+
+    WindowCenter and WindowWidth are the usual offenders.
+
+    Args:
+        value: The raw tag value, or None.
+        default: What to return when the value is missing or unparseable.
+
+    Returns:
+        The first value as a float, or ``default``.
+    """
     if value is None:
         return default
     if isinstance(value, pydicom.multival.MultiValue):
@@ -43,10 +82,29 @@ def _first(value, default=None) -> float | None:
 
 
 def read_dataset(b: bytes) -> pydicom.Dataset:
+    """Parse DICOM bytes.
+
+    Args:
+        b: Raw file bytes.
+
+    Returns:
+        The dataset. Read with ``force=True``, so headerless files parse too.
+    """
     return pydicom.dcmread(io.BytesIO(b), force=True)
 
 
 def load_single(b: bytes) -> DicomImage:
+    """Load one DICOM file.
+
+    Args:
+        b: Raw file bytes.
+
+    Returns:
+        A :class:`DicomImage` of kind ``"single"``, with one frame or many.
+
+    Raises:
+        ValueError: If the file carries no PixelData.
+    """
     ds = read_dataset(b)
     if "PixelData" not in ds:
         raise ValueError("File contains no PixelData.")
@@ -55,7 +113,16 @@ def load_single(b: bytes) -> DicomImage:
 
 
 def _meta(ds: pydicom.Dataset, frames: int) -> dict:
-    """Non-identifying technical metadata, carried into the export for traceability."""
+    """Collect non-identifying technical metadata, carried into the export.
+
+    Args:
+        ds: The parsed dataset.
+        frames: Frame count, already resolved.
+
+    Returns:
+        Modality, geometry, UIDs, series description, pixel spacing and the
+        file's own window. No patient identifiers.
+    """
     return {
         "modality": str(getattr(ds, "Modality", "") or ""),
         "rows": int(getattr(ds, "Rows", 0) or 0),
@@ -73,7 +140,18 @@ def _meta(ds: pydicom.Dataset, frames: int) -> dict:
 
 
 def dataset_for_frame(img: DicomImage, frame: int) -> tuple[pydicom.Dataset, int]:
-    """Map a global frame index onto (dataset, index within that dataset)."""
+    """Map a global frame index onto the dataset that holds it.
+
+    Args:
+        img: The loaded image.
+        frame: Global frame index.
+
+    Returns:
+        ``(dataset, index_within_that_dataset)``.
+
+    Raises:
+        IndexError: If the frame index is out of range.
+    """
     if frame < 0 or frame >= img.frames:
         raise IndexError(f"frame {frame} out of range (0..{img.frames - 1})")
     if img.kind == "series":
@@ -82,17 +160,39 @@ def dataset_for_frame(img: DicomImage, frame: int) -> tuple[pydicom.Dataset, int
 
 
 def frame_shape(img: DicomImage, frame: int) -> tuple[int, int]:
-    """(rows, columns) of one frame.
+    """Get one frame's geometry, from the header -- no pixel decode.
 
-    A zipped folder may hold images of different sizes, so geometry is per
-    frame, not per study. Read from the header -- no pixel decode.
+    A picked folder routinely holds images of different sizes, so geometry is
+    per frame, not per study.
+
+    Args:
+        img: The loaded image.
+        frame: Global frame index.
+
+    Returns:
+        ``(rows, columns)``.
+
+    Raises:
+        IndexError: If the frame index is out of range.
     """
     ds, _ = dataset_for_frame(img, frame)
     return int(getattr(ds, "Rows", 0) or 0), int(getattr(ds, "Columns", 0) or 0)
 
 
 def _raw_frame(img: DicomImage, frame: int) -> np.ndarray:
-    """Decoded frame after the modality LUT. Grayscale float32, or uint8 RGB."""
+    """Decode one frame and apply the modality LUT, caching the result.
+
+    Args:
+        img: The loaded image.
+        frame: Global frame index.
+
+    Returns:
+        Grayscale float32 in modality units, or uint8 RGB for colour and
+        palette images.
+
+    Raises:
+        IndexError: If the frame index is out of range.
+    """
     if frame in img._cache:
         return img._cache[frame]
 
@@ -121,6 +221,14 @@ def _raw_frame(img: DicomImage, frame: int) -> np.ndarray:
 
 
 def _minmax_u8(a: np.ndarray) -> np.ndarray:
+    """Scale an array to 8 bits by its own range.
+
+    Args:
+        a: Any numeric array.
+
+    Returns:
+        uint8 array of the same shape; all zeros if the input is constant.
+    """
     lo, hi = float(a.min()), float(a.max())
     if hi <= lo:
         return np.zeros(a.shape, dtype=np.uint8)
@@ -128,7 +236,19 @@ def _minmax_u8(a: np.ndarray) -> np.ndarray:
 
 
 def default_window(img: DicomImage, frame: int) -> tuple[float, float]:
-    """The window the viewer opens with: DICOM WC/WW if present, else 1-99 pct."""
+    """Get the window the viewer opens with.
+
+    Args:
+        img: The loaded image.
+        frame: Global frame index.
+
+    Returns:
+        ``(center, width)``: the file's own WindowCenter/WindowWidth when
+        present, otherwise the 1st-99th percentile span of the pixels.
+
+    Raises:
+        IndexError: If the frame index is out of range.
+    """
     ds, _ = dataset_for_frame(img, frame)
     wc = _first(getattr(ds, "WindowCenter", None))
     ww = _first(getattr(ds, "WindowWidth", None))
@@ -147,10 +267,25 @@ def default_window(img: DicomImage, frame: int) -> tuple[float, float]:
 def frame_uint8(img: DicomImage, frame: int,
                 window_center: float | None = None,
                 window_width: float | None = None) -> np.ndarray:
-    """Displayable 8-bit frame. HxW for grayscale, HxWx3 for color.
+    """Render one frame for display.
 
     This is exactly what the browser shows AND what the model sees, so a click
     at (x, y) means the same thing to the user and to SAM.
+
+    Args:
+        img: The loaded image.
+        frame: Global frame index.
+        window_center: Explicit window centre. Omit both this and the width to
+            use the file's VOI LUT, which may be a lookup table rather than a
+            simple centre/width.
+        window_width: Explicit window width.
+
+    Returns:
+        8-bit HxW grayscale, or HxWx3 RGB for colour images. MONOCHROME1 is
+        inverted so it displays the way a reader expects.
+
+    Raises:
+        IndexError: If the frame index is out of range.
     """
     a = _raw_frame(img, frame)
     if a.ndim == 3:  # already-normalised color
@@ -176,6 +311,16 @@ def frame_uint8(img: DicomImage, frame: int,
 
 
 def _window_u8(a: np.ndarray, wc: float, ww: float) -> np.ndarray:
+    """Apply a linear window to a frame.
+
+    Args:
+        a: Frame in modality units.
+        wc: Window centre.
+        ww: Window width; clamped away from zero.
+
+    Returns:
+        uint8 array of the same shape.
+    """
     ww = max(float(ww), 1e-6)
     lo = wc - ww / 2.0
     return np.clip((a - lo) / ww * 255.0 + 0.5, 0, 255).astype(np.uint8)
@@ -184,7 +329,20 @@ def _window_u8(a: np.ndarray, wc: float, ww: float) -> np.ndarray:
 def frame_rgb(img: DicomImage, frame: int,
               window_center: float | None = None,
               window_width: float | None = None) -> np.ndarray:
-    """HxWx3 uint8 for the model."""
+    """Render one frame for the model.
+
+    Args:
+        img: The loaded image.
+        frame: Global frame index.
+        window_center: Explicit window centre, or None for the file's own.
+        window_width: Explicit window width, or None for the file's own.
+
+    Returns:
+        HxWx3 uint8, grayscale replicated across channels.
+
+    Raises:
+        IndexError: If the frame index is out of range.
+    """
     g = frame_uint8(img, frame, window_center, window_width)
     if g.ndim == 3:
         return g

@@ -1,30 +1,63 @@
+/**
+ * @fileoverview The right panel: name the mask, tune it, and manage the ones
+ * already on this frame.
+ *
+ * The label field is the first thing here because labelling is the point: the
+ * chips reuse a label the folder already knows, which is what keeps a colour
+ * consistent across every file.
+ */
 import type { Annotation, Draft, LabelSummary } from '../types'
 import { draftIsEmpty } from '../types'
 
+/** Props for {@link SidePanel}. */
 type Props = {
+  /** The mask being built or edited. */
   draft: Draft
   setDraft: (d: Draft) => void
+  /** Labels already used in this workspace, with their colours and counts. */
   labels: LabelSummary[]
+  /** Every annotation on the open file; the list below shows this frame's. */
   annotations: Annotation[]
   frame: number
   frames: number
+  /** Foreground pixels in the live preview, or null when there is none. */
   previewArea: number | null
+  /** The preview's predicted IoU, or null. */
   previewScore: number | null
+  /** True while a request is in flight; commit is disabled. */
   busy: boolean
+  /** The last error, shown under the buttons. */
   error: string | null
+  /** Called to save the draft. */
   onCommit: () => void
+  /** Called to discard the draft. */
   onCancel: () => void
+  /** Called to load a committed mask back into the draft. */
   onEdit: (a: Annotation) => void
+  /** Called to delete a mask. */
   onDelete: (id: string) => void
+  /** Called to rename a mask. */
   onRename: (a: Annotation) => void
 }
 
+/**
+ * Renders the mask panel.
+ *
+ * @param p Component props.
+ * @return The panel: label field, candidate and threshold, the commit buttons,
+ *     this frame's masks and the shortcut list.
+ */
 export default function SidePanel(p: Props) {
   const { draft } = p
   const editing = draft.editing !== null
   const onThisFrame = p.annotations.filter((a) => a.frame === p.frame)
   const canCommit = !draftIsEmpty(draft) && draft.label.trim().length > 0
 
+  /**
+   * Updates part of the draft.
+   *
+   * @param patch The fields to change.
+   */
   const set = (patch: Partial<Draft>) => p.setDraft({ ...draft, ...patch })
 
   return (

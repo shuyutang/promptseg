@@ -1,12 +1,25 @@
+"""COCO-style uncompressed run-length encoding for binary masks.
+
+Masks travel to the client and into the export as run lengths rather than
+pixels. The encoding is the COCO uncompressed variant: column-major (Fortran)
+runs that always begin with a run of zeros, possibly of length zero. Consumers
+that already read COCO need no special case for this export.
+"""
 from __future__ import annotations
 import numpy as np
 
-# COCO-style uncompressed RLE: column-major (Fortran) run lengths, always
-# starting with a run of zeros (possibly length 0).
-
 
 def mask_to_rle(mask: np.ndarray) -> dict:
-    """mask: HxW, 0/1. Returns {"counts": [...], "size": [h, w]}."""
+    """Encode a binary mask as column-major run lengths.
+
+    Args:
+        mask: HxW array of 0/1 (any integer or boolean dtype).
+
+    Returns:
+        ``{"counts": [int, ...], "size": [height, width]}``. The first run is
+        always a run of zeros, so a mask whose top-left pixel is set gets a
+        leading ``0`` count.
+    """
     h, w = mask.shape
     flat = np.asarray(mask, dtype=np.uint8).ravel(order="F")
     if flat.size == 0:
@@ -25,7 +38,15 @@ def mask_to_rle(mask: np.ndarray) -> dict:
 
 
 def rle_to_mask(rle: dict) -> np.ndarray:
-    """Inverse of mask_to_rle."""
+    """Decode run lengths back into a mask. Inverse of :func:`mask_to_rle`.
+
+    Args:
+        rle: ``{"counts": [...], "size": [height, width]}`` as produced by
+            :func:`mask_to_rle`.
+
+    Returns:
+        HxW uint8 array of 0/1.
+    """
     h, w = rle["size"]
     counts = list(rle["counts"])
     flat = np.zeros(h * w, dtype=np.uint8)
@@ -39,7 +60,14 @@ def rle_to_mask(rle: dict) -> np.ndarray:
 
 
 def mask_bbox(mask: np.ndarray) -> list[int] | None:
-    """[x, y, w, h] of the foreground, or None if the mask is empty."""
+    """Tight bounding box around the foreground.
+
+    Args:
+        mask: HxW array; any non-zero pixel counts as foreground.
+
+    Returns:
+        ``[x, y, width, height]``, or None if the mask is empty.
+    """
     ys, xs = np.nonzero(mask)
     if ys.size == 0:
         return None

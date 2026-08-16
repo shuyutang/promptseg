@@ -1,3 +1,16 @@
+/**
+ * @fileoverview The application: all state lives here, the panels are views of it.
+ *
+ * Layout is fixed at three columns -- file list, image, mask panel -- and the
+ * flow of a session runs left to right: pick a folder, click a thing, name what
+ * you clicked.
+ *
+ * Two invariants worth keeping. Geometry is read per file (`FrameInfo`), never
+ * assumed for the folder, because a picked directory routinely mixes sizes. And
+ * mask pixels are never touched here: the server renders the base frame, the
+ * overlay and the preview as PNGs, and the canvas holds only prompt markers and
+ * the stroke still under the pointer.
+ */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as api from './api'
 import FileList from './components/FileList'
@@ -9,11 +22,32 @@ import type {
 } from './types'
 import { draftIsEmpty, emptyDraft } from './types'
 
+/** Used until the workspace has assigned the label a colour of its own. */
 const FALLBACK_COLOR = '#E8453C'
-const PREVIEW_DEBOUNCE = 70   // ms; enough to coalesce a burst of clicks
 
+/** Milliseconds to wait before previewing; enough to coalesce a burst of clicks. */
+const PREVIEW_DEBOUNCE = 70
+
+/**
+ * Mask fill opacity, 0-255. Fixed rather than a control: it is a view setting
+ * with one sensible value -- masks readable, the image still visible under them --
+ * and the checkbox covers the case where it is in the way.
+ */
+const MASK_ALPHA = 110
+
+/**
+ * Renders a thrown value as text.
+ *
+ * @param e Anything a rejected promise produced.
+ * @return Its message, or its string form.
+ */
 const msg = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
+/**
+ * The whole application.
+ *
+ * @return The three-column layout, wired to one piece of state.
+ */
 export default function App() {
   const [ws, setWs] = useState<WorkspaceListing | null>(null)
   const [currentId, setCurrentId] = useState<string | null>(null)
@@ -27,7 +61,6 @@ export default function App() {
   const [tool, setTool] = useState<Tool>('include')
   const [brushRadius, setBrushRadius] = useState(8)
   const [zoom, setZoom] = useState(1)
-  const [opacity, setOpacity] = useState(110)
   const [showMasks, setShowMasks] = useState(true)
 
   const [busy, setBusy] = useState(false)
@@ -44,8 +77,10 @@ export default function App() {
 
   // ---- data loading ---------------------------------------------------
 
+  // Show which model answered, so a stub or a CPU fallback is never a surprise.
   useEffect(() => { api.health().then((h) => setModel(h.model)).catch(() => {}) }, [])
 
+  // Track the stage's size, since the fit-to-window scale depends on it.
   useEffect(() => {
     const el = stage.current
     if (!el) return
@@ -54,6 +89,7 @@ export default function App() {
     return () => ro.disconnect()
   }, [])
 
+  // Geometry is per file and per frame, so it is re-read on every move.
   useEffect(() => {
     if (!currentId) { setInfo(null); return }
     let live = true
@@ -63,6 +99,11 @@ export default function App() {
     return () => { live = false }
   }, [currentId, frame])
 
+  /**
+   * Reloads one image's annotations from the server.
+   *
+   * @param id Image id.
+   */
   const reloadAnnotations = useCallback(async (id: string) => {
     setAnnotations(await api.listAnnotations(id))
   }, [])
@@ -72,6 +113,12 @@ export default function App() {
     reloadAnnotations(currentId).catch((e) => setError(msg(e)))
   }, [currentId, reloadAnnotations])
 
+  /**
+   * Looks up the colour the workspace assigned to a label.
+   *
+   * @param label Label as typed; matched case-insensitively.
+   * @return Its hex colour, or the fallback for a label not used yet.
+   */
   const colorFor = useCallback((label: string) => {
     const hit = ws?.labels.find((l) => l.name.toLowerCase() === label.trim().toLowerCase())
     return hit?.color ?? FALLBACK_COLOR
@@ -79,6 +126,7 @@ export default function App() {
 
   // ---- live preview ---------------------------------------------------
 
+  // Re-segment as the draft changes, debounced, cancelling whatever is in flight.
   useEffect(() => {
     if (!currentId || draftIsEmpty(draft)) { setPreview(null); return }
     const ctrl = new AbortController()
@@ -96,6 +144,13 @@ export default function App() {
 
   // ---- actions --------------------------------------------------------
 
+  /**
+   * Opens a file, resetting everything that belongs to the previous one.
+   *
+   * The label survives, because the next file usually needs the same one.
+   *
+   * @param id Image id to show.
+   */
   const select = useCallback((id: string) => {
     setCurrentId(id)
     setFrame(0)
@@ -105,6 +160,13 @@ export default function App() {
     setDraft((d) => emptyDraft(d.label))
   }, [])
 
+  /**
+   * Uploads what the picker returned.
+   *
+   * @param files The picked files.
+   * @param fresh True to start a new workspace (a folder pick), false to append
+   *     to the current one.
+   */
   const pick = async (files: File[], fresh: boolean) => {
     setBusy(true)
     setError(null)
@@ -121,11 +183,17 @@ export default function App() {
     }
   }
 
+  /** Re-reads the workspace, so counts, labels and progress stay honest. */
   const refreshWorkspace = useCallback(async () => {
     if (!ws) return
     try { setWs(await api.getWorkspace(ws.workspace_id)) } catch (e) { setError(msg(e)) }
   }, [ws])
 
+  /**
+   * Saves the draft: a new mask, or the edit of the one being worked on.
+   *
+   * Keeps the label afterwards, since the next instance usually shares it.
+   */
   const commit = async () => {
     if (!currentId || draftIsEmpty(draft) || !draft.label.trim()) return
     setBusy(true)
@@ -155,6 +223,12 @@ export default function App() {
     }
   }
 
+  /**
+   * Loads a committed mask back into the draft, so editing resumes from the
+   * exact state it was made in -- prompts, strokes, threshold and window alike.
+   *
+   * @param a The annotation to edit.
+   */
   const editAnnotation = (a: Annotation) => {
     setDraft({
       editing: a.id, label: a.label,
@@ -165,6 +239,11 @@ export default function App() {
     setError(null)
   }
 
+  /**
+   * Deletes a mask, clearing the draft if it was the one being edited.
+   *
+   * @param id Annotation id.
+   */
   const removeAnnotation = async (id: string) => {
     setBusy(true)
     try {
@@ -176,6 +255,11 @@ export default function App() {
     } catch (e) { setError(msg(e)) } finally { setBusy(false) }
   }
 
+  /**
+   * Renames a mask, which may also move it to another label's colour.
+   *
+   * @param a The annotation to rename.
+   */
   const renameAnnotation = async (a: Annotation) => {
     const next = window.prompt(`Rename "${a.label} #${a.instance}"`, a.label)
     if (!next || next === a.label) return
@@ -187,6 +271,12 @@ export default function App() {
     } catch (e) { setError(msg(e)) }
   }
 
+  /**
+   * Marks a file done, or not done.
+   *
+   * @param id Image id.
+   * @param value The new state.
+   */
   const toggleReviewed = async (id: string, value: boolean) => {
     // Flip locally first: a controlled checkbox that waits for the server reads
     // as an unresponsive click.
@@ -197,6 +287,11 @@ export default function App() {
     await refreshWorkspace()
   }
 
+  /**
+   * Removes a file from the workspace, moving on if it was the open one.
+   *
+   * @param id Image id.
+   */
   const removeImage = async (id: string) => {
     try {
       await api.deleteImage(id)
@@ -209,6 +304,12 @@ export default function App() {
     } catch (e) { setError(msg(e)) }
   }
 
+  /**
+   * Saves a server response to disk, via a synthetic link.
+   *
+   * @param path URL to download.
+   * @param filename Name to suggest to the browser.
+   */
   const download = (path: string, filename: string) => {
     const a = document.createElement('a')
     a.href = path
@@ -218,6 +319,11 @@ export default function App() {
     a.remove()
   }
 
+  /**
+   * Moves through the file list, stopping at either end.
+   *
+   * @param delta How many files to move; 1 for next, -1 for previous.
+   */
   const step = useCallback((delta: number) => {
     if (!images.length) return
     const i = images.findIndex((im) => im.image_id === currentId)
@@ -227,7 +333,15 @@ export default function App() {
 
   // ---- keyboard -------------------------------------------------------
 
+  // Deliberately re-bound on every render: the handler closes over the draft and
+  // the current file, and stale copies would commit the wrong thing.
   useEffect(() => {
+    /**
+     * Handles a global shortcut.
+     *
+     * @param e The key event. Keys are ignored while a text field has focus, so
+     *     typing a label never fires a tool.
+     */
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement | null
       if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) {
@@ -256,15 +370,17 @@ export default function App() {
 
   // ---- geometry -------------------------------------------------------
 
+  // Fit the frame to the stage, then apply the user's zoom on top.
   const scale = useMemo(() => {
     if (!info) return 1
     const fit = Math.min((stageSize.w - 40) / info.columns, (stageSize.h - 40) / info.rows)
     return Math.max(0.05, (Number.isFinite(fit) && fit > 0 ? fit : 1) * zoom)
   }, [info, stageSize, zoom])
 
+  // Skip the overlay request entirely when this frame has nothing on it.
   const overlay = currentId && showMasks && annotations.some((a) => a.frame === frame)
     ? api.overlayUrl(currentId, frame, {
-        selected: draft.editing, exclude: draft.editing, alpha: opacity, bust,
+        selected: draft.editing, exclude: draft.editing, alpha: MASK_ALPHA, bust,
       })
     : null
 
@@ -291,7 +407,6 @@ export default function App() {
           win={win} defaultWin={info?.default_window ?? null} setWin={setWin}
           windowing={info?.windowing ?? false}
           zoom={zoom} setZoom={setZoom}
-          opacity={opacity} setOpacity={setOpacity}
           showMasks={showMasks} setShowMasks={setShowMasks}
         />
 

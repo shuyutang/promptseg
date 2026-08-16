@@ -1,3 +1,8 @@
+"""Mask encoding and label colours.
+
+Two things a consumer of the export depends on: that the RLE decodes back to the
+mask that was drawn, and that two labels in one image never look alike.
+"""
 from __future__ import annotations
 import numpy as np
 import pytest
@@ -13,6 +18,11 @@ from utils.rle import mask_bbox, mask_to_rle, rle_to_mask
     (np.random.default_rng(0).random((32, 24)) > 0.7).astype(np.uint8),
 ])
 def test_rle_roundtrip(mask):
+    """Encoding then decoding returns the same mask, empty and full included.
+
+    Args:
+        mask: The parametrised mask under test.
+    """
     assert np.array_equal(rle_to_mask(mask_to_rle(mask)), mask)
 
 
@@ -25,6 +35,7 @@ def test_rle_starts_with_zero_run():
 
 
 def test_bbox():
+    """The bounding box is [x, y, w, h], and None for an empty mask."""
     m = np.zeros((10, 10), np.uint8)
     m[3:6, 2:8] = 1
     assert mask_bbox(m) == [2, 3, 6, 3]  # x, y, w, h
@@ -32,12 +43,14 @@ def test_bbox():
 
 
 def test_label_color_is_deterministic_and_case_insensitive():
+    """A label's colour depends only on its canonical form."""
     assert default_color("Vertebra") == default_color("  vertebra ")
     assert canonical("  Left   Kidney ") == "left kidney"
     assert hex_to_rgb("#E8453C") == (232, 69, 60)
 
 
 def test_same_label_same_color_distinct_labels_differ():
+    """One label keeps one colour; distinct labels do not collide."""
     reg = LabelRegistry()
     a1 = reg.color_for("liver")
     a2 = reg.color_for("LIVER")

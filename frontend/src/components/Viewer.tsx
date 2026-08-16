@@ -1,25 +1,60 @@
+/**
+ * @fileoverview The image itself: four stacked layers and all pointer handling.
+ *
+ * Bottom to top the layers are the base frame PNG, the overlay of committed
+ * masks, the live preview, and a canvas. Only the canvas is drawn here, and it
+ * holds nothing but prompt markers and the stroke still under the pointer --
+ * every mask pixel comes from the server, so client and server can never
+ * disagree about what a mask covers.
+ *
+ * The canvas is sized in native image pixels and scaled by CSS, which is what
+ * lets a click be mapped straight back to image coordinates at any zoom.
+ */
 import { useEffect, useRef, useState } from 'react'
 import type { Box, Draft, Stroke, Tool } from '../types'
 
+/** Props for {@link Viewer}. */
 type Props = {
+  /** Frame height in native pixels. */
   rows: number
+  /** Frame width in native pixels. */
   columns: number
+  /** Screen pixels per image pixel. */
   scale: number
+  /** URL of the rendered frame. */
   baseUrl: string
+  /** URL of the committed-mask overlay, or null when there is nothing to show. */
   overlayUrl: string | null
+  /** Object URL of the live preview, or null. */
   previewUrl: string | null
+  /** The draft, whose points and boxes are drawn as markers. */
   draft: Draft
+  /** The selected pointer tool. */
   tool: Tool
+  /** Brush and eraser radius, in image pixels. */
   brushRadius: number
+  /** The label's colour, used for the in-flight brush stroke. */
   brushColor: string
+  /** Called with a click, in image pixels; `label` 1 includes, 0 excludes. */
   onPoint: (x: number, y: number, label: 1 | 0) => void
+  /** Called with a finished box, in image pixels. */
   onBox: (box: Box) => void
+  /** Called with a finished brush or eraser stroke. */
   onStroke: (stroke: Stroke) => void
 }
 
-const DOT = 4          // marker radius in screen px, kept constant across zoom
-const MIN_BOX = 3      // ignore accidental micro-drags
+/** Marker radius in screen px, kept constant across zoom. */
+const DOT = 4
 
+/** Drags shorter than this, in image px, are treated as clicks. */
+const MIN_BOX = 3
+
+/**
+ * Renders the image stack and turns pointer events into prompts.
+ *
+ * @param p Component props.
+ * @return The layered viewer at the current scale.
+ */
 export default function Viewer(p: Props) {
   const { rows, columns, scale } = p
   const canvas = useRef<HTMLCanvasElement>(null)
@@ -31,6 +66,12 @@ export default function Viewer(p: Props) {
 
   useEffect(() => { setWip(null) }, [p.previewUrl])
 
+  /**
+   * Maps a pointer event to image coordinates.
+   *
+   * @param e The pointer event.
+   * @return `[x, y]` in native image pixels, clamped to the frame.
+   */
   const native = (e: React.PointerEvent): [number, number] => {
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
     return [
@@ -39,6 +80,11 @@ export default function Viewer(p: Props) {
     ]
   }
 
+  /**
+   * Starts a click, a box or a stroke, depending on the tool and the button.
+   *
+   * @param e The pointer event.
+   */
   const down = (e: React.PointerEvent) => {
     if (e.button !== 0 && e.button !== 2) return
     e.preventDefault()
@@ -52,6 +98,11 @@ export default function Viewer(p: Props) {
     p.onPoint(x, y, p.tool === 'exclude' ? 0 : 1)
   }
 
+  /**
+   * Extends the drag in progress and tracks the brush cursor.
+   *
+   * @param e The pointer event.
+   */
   const move = (e: React.PointerEvent) => {
     const pt = native(e)
     setHover(pt)
@@ -60,6 +111,7 @@ export default function Viewer(p: Props) {
     else setDrag({ kind: 'paint', pts: [...drag.pts, pt] })
   }
 
+  /** Finishes the drag, emitting a box, a stroke, or a click if it was tiny. */
   const up = () => {
     if (!drag) return
     const pts = drag.pts
@@ -84,6 +136,8 @@ export default function Viewer(p: Props) {
 
   // ---- marker layer ---------------------------------------------------
 
+  // Redraw the markers: the in-flight stroke, boxes, points and the brush
+  // cursor. Line widths divide by the scale so they stay constant on screen.
   useEffect(() => {
     const c = canvas.current
     if (!c) return

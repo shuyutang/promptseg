@@ -1,3 +1,6 @@
+# GPU image for the backend. Weights are not baked in: they are downloaded on
+# first start into a mounted cache, so changing SAM2_MODEL_ID needs no rebuild.
+# Build and run it with ./start_server.sh.
 FROM nvidia/cuda:12.9.1-runtime-ubuntu24.04
 
 # System libs to decode JPEG/JPEG2000 in DICOMs
