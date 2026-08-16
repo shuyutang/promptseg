@@ -197,3 +197,15 @@ class LabelRegistry:
             A copy mapping canonical label to hex colour.
         """
         return dict(self._colors)
+
+    def restore(self, colors: dict[str, str]) -> None:
+        """Adopt a previously saved assignment.
+
+        Reopening a saved session has to put every label back on the colour the
+        user learned; re-deriving them would be almost right, and wrong exactly
+        where a collision had been resolved.
+
+        Args:
+            colors: Canonical label to hex colour, as :meth:`as_dict` produced.
+        """
+        self._colors = {canonical(k): v for k, v in colors.items()}

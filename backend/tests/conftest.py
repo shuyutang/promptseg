@@ -15,6 +15,10 @@ import pytest
 # Tests exercise the full API without downloading SAM weights or needing a GPU.
 os.environ.setdefault("SAM2_STUB", "1")
 
+# Memory-only by default, so a test run never writes into the user's real data
+# directory. test_persistence.py turns it back on against a tmp_path of its own.
+os.environ.setdefault("SAM2_PERSIST", "0")
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pydicom.data import get_testdata_file  # noqa: E402

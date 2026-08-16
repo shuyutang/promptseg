@@ -14,11 +14,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as api from './api'
 import FileList from './components/FileList'
+import Sessions from './components/Sessions'
 import SidePanel from './components/SidePanel'
 import Toolbar from './components/Toolbar'
 import Viewer from './components/Viewer'
 import type {
-  Annotation, Box, Draft, FrameInfo, PreviewResult, Stroke, Tool, Window, WorkspaceListing,
+  Annotation, Box, Draft, FrameInfo, PreviewResult, SessionSummary, Stroke, Tool,
+  Window, WorkspaceListing,
 } from './types'
 import { draftIsEmpty, emptyDraft } from './types'
 
@@ -68,6 +70,9 @@ export default function App() {
   const [uploadErrors, setUploadErrors] = useState<string[]>([])
   const [bust, setBust] = useState(0)
   const [model, setModel] = useState('')
+  const [sessions, setSessions] = useState<SessionSummary[]>([])
+  const [persist, setPersist] = useState(true)
+  const [showSessions, setShowSessions] = useState(false)
 
   const stage = useRef<HTMLDivElement>(null)
   const [stageSize, setStageSize] = useState({ w: 900, h: 700 })
@@ -79,6 +84,17 @@ export default function App() {
 
   // Show which model answered, so a stub or a CPU fallback is never a surprise.
   useEffect(() => { api.health().then((h) => setModel(h.model)).catch(() => {}) }, [])
+
+  /** Re-reads the saved sessions, so the resume list matches what is on disk. */
+  const refreshSessions = useCallback(async () => {
+    try {
+      const r = await api.listSessions()
+      setSessions(r.sessions)
+      setPersist(r.persist)
+    } catch { /* the resume list is a convenience; its absence is not an error */ }
+  }, [])
+
+  useEffect(() => { refreshSessions() }, [refreshSessions])
 
   // Track the stage's size, since the fit-to-window scale depends on it.
   useEffect(() => {
@@ -180,6 +196,7 @@ export default function App() {
       setError(msg(e))
     } finally {
       setBusy(false)
+      refreshSessions()
     }
   }
 
@@ -187,7 +204,50 @@ export default function App() {
   const refreshWorkspace = useCallback(async () => {
     if (!ws) return
     try { setWs(await api.getWorkspace(ws.workspace_id)) } catch (e) { setError(msg(e)) }
-  }, [ws])
+    refreshSessions()
+  }, [ws, refreshSessions])
+
+  /**
+   * Reopens a saved session, putting its files and masks back on screen.
+   *
+   * @param id Workspace id from the resume list.
+   */
+  const openSession = async (id: string) => {
+    setBusy(true)
+    setError(null)
+    try {
+      const r = await api.openSession(id)
+      setWs(r)
+      setUploadErrors(r.errors)
+      setShowSessions(false)
+      if (r.images.length) select(r.images[0].image_id)
+      else { setCurrentId(null); setAnnotations([]) }
+    } catch (e) {
+      setError(msg(e))
+    } finally {
+      setBusy(false)
+      refreshSessions()
+    }
+  }
+
+  /**
+   * Deletes a saved session. Closes it first if it is the one on screen.
+   *
+   * @param id Workspace id.
+   */
+  const removeSession = async (id: string) => {
+    if (!confirm('Delete this saved session? Its images and masks are removed from the server.')) return
+    try {
+      await api.deleteSession(id)
+      if (ws?.workspace_id === id) {
+        setWs(null)
+        setCurrentId(null)
+        setAnnotations([])
+        setUploadErrors([])
+      }
+    } catch (e) { setError(msg(e)) }
+    refreshSessions()
+  }
 
   /**
    * Saves the draft: a new mask, or the edit of the one being worked on.
@@ -391,6 +451,12 @@ export default function App() {
         currentId={currentId}
         busy={busy}
         errors={uploadErrors}
+        sessions={sessions}
+        persist={persist}
+        showSessions={showSessions}
+        onToggleSessions={() => { setShowSessions((v) => !v); refreshSessions() }}
+        onOpenSession={openSession}
+        onDeleteSession={removeSession}
         onPick={(files) => pick(files, files.some((f) => (f as File & { webkitRelativePath?: string }).webkitRelativePath))}
         onSelect={select}
         onToggleReviewed={toggleReviewed}
@@ -432,6 +498,13 @@ export default function App() {
               <h2>Open a folder of images</h2>
               <p>DICOM, PNG, JPEG, TIFF or a .zip. Every file shows up in the list on the left;
                  label them one by one and export the whole batch in a single file.</p>
+              {(persist || sessions.length > 0) && (
+                <div className="resume">
+                  <h3>Pick up where you left off</h3>
+                  <Sessions sessions={sessions} persist={persist} currentId={ws?.workspace_id ?? null}
+                            busy={busy} onOpen={openSession} onDelete={removeSession} />
+                </div>
+              )}
             </div>
           )}
         </div>

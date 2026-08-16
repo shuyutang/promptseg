@@ -6,7 +6,8 @@
  * where they are visible the whole time.
  */
 import { useRef } from 'react'
-import type { ImageListing, WorkspaceListing } from '../types'
+import Sessions from './Sessions'
+import type { ImageListing, SessionSummary, WorkspaceListing } from '../types'
 
 /** Props for {@link FileList}. */
 type Props = {
@@ -18,6 +19,18 @@ type Props = {
   busy: boolean
   /** Per-file load errors, shown collapsed rather than as a failure. */
   errors: string[]
+  /** The sessions the server has saved, most recently worked on first. */
+  sessions: SessionSummary[]
+  /** False when the server keeps state in memory only. */
+  persist: boolean
+  /** Whether the resume list is showing in place of the file list. */
+  showSessions: boolean
+  /** Called to show or hide the resume list. */
+  onToggleSessions: () => void
+  /** Called with the workspace id to reopen. */
+  onOpenSession: (id: string) => void
+  /** Called with the workspace id to delete from the server. */
+  onDeleteSession: (id: string) => void
   /** Called with what the picker returned. */
   onPick: (files: File[]) => void
   /** Called with the image id to open. */
@@ -83,6 +96,10 @@ export default function FileList(p: Props) {
       <div className="row gap">
         <button onClick={() => folderRef.current?.click()} disabled={p.busy}>Open folder…</button>
         <button onClick={() => filesRef.current?.click()} disabled={p.busy}>Add files…</button>
+        <button className={p.showSessions ? 'on' : ''} onClick={p.onToggleSessions}
+                title="Sessions saved on the server — reopen one and carry on">
+          ⟲ Saved{p.sessions.length ? ` (${p.sessions.length})` : ''}
+        </button>
       </div>
       <input ref={folderRef} type="file" webkitdirectory="" multiple hidden
              onChange={(e) => pick(e.currentTarget)} />
@@ -98,6 +115,13 @@ export default function FileList(p: Props) {
         </details>
       )}
 
+      {p.showSessions ? (
+        <div className="list" aria-label="Saved sessions">
+          <Sessions sessions={p.sessions} persist={p.persist} busy={p.busy}
+                    currentId={ws?.workspace_id ?? null}
+                    onOpen={p.onOpenSession} onDelete={p.onDeleteSession} />
+        </div>
+      ) : (
       <div className="list" role="listbox" aria-label="Images">
         {images.map((im: ImageListing) => (
           <div
@@ -127,6 +151,7 @@ export default function FileList(p: Props) {
         ))}
         {!images.length && <p className="hint pad">Nothing loaded yet.</p>}
       </div>
+      )}
 
       {ws && (
         <div className="panel-foot">

@@ -14,6 +14,7 @@ import io
 import posixpath
 import re
 import zipfile
+from typing import NamedTuple
 
 from media.base import ImageSource
 from media.dicom_source import DicomSource
@@ -28,6 +29,23 @@ _JUNK = re.compile(r"(^|/)(\.|__MACOSX/|Thumbs\.db$|DICOMDIR$)", re.IGNORECASE)
 
 class LoadError(Exception):
     """One file failed; the rest of the batch still loads."""
+
+
+class LoadedFile(NamedTuple):
+    """One file that read cleanly.
+
+    The original bytes travel with the decoded source because they are what a
+    saved session stores -- a mask cannot be reopened without the pixels it was
+    drawn on, and re-encoding a decoded frame would not be the same file.
+
+    Attributes:
+        name: Path within the picked folder, as uploaded.
+        source: The decoded file.
+        data: The original bytes, after any zip expansion.
+    """
+    name: str
+    source: ImageSource
+    data: bytes
 
 
 def _ext(name: str) -> str:
@@ -132,23 +150,23 @@ def _series_of(src: ImageSource) -> tuple[str, float | None]:
     return uid, (float(n) if n is not None else None)
 
 
-def sort_loaded(items: list[tuple[str, ImageSource]]) -> list[tuple[str, ImageSource]]:
+def sort_loaded(items: list[LoadedFile]) -> list[LoadedFile]:
     """Order a folder the way a reader expects.
 
     Folders stay together, each series is contiguous and in slice order, and
     everything else falls back to natural filename order.
 
     Args:
-        items: ``(name, source)`` pairs in upload order.
+        items: The files that loaded, in upload order.
 
     Returns:
-        The same pairs, reordered.
+        The same files, reordered.
     """
     rows = []
-    for name, src in items:
-        uid, z = _series_of(src)
-        rows.append({"name": name, "src": src, "dir": posixpath.dirname(name).lower(),
-                     "uid": uid, "z": z, "nat": _natural(name)})
+    for item in items:
+        uid, z = _series_of(item.source)
+        rows.append({"item": item, "dir": posixpath.dirname(item.name).lower(),
+                     "uid": uid, "z": z, "nat": _natural(item.name)})
 
     # A group sits where its first-named member would have sat, so series stay
     # contiguous without jumping to the front of the folder.
@@ -163,7 +181,7 @@ def sort_loaded(items: list[tuple[str, ImageSource]]) -> list[tuple[str, ImageSo
         (0, r["z"]) if r["z"] is not None else (1, 0.0),
         r["nat"],
     ))
-    return [(r["name"], r["src"]) for r in rows]
+    return [r["item"] for r in rows]
 
 
 def expand(filename: str, data: bytes) -> list[tuple[str, bytes]]:
@@ -192,7 +210,7 @@ def expand(filename: str, data: bytes) -> list[tuple[str, bytes]]:
     return out
 
 
-def load_batch(files: list[tuple[str, bytes]]) -> tuple[list[tuple[str, ImageSource]], list[str]]:
+def load_batch(files: list[tuple[str, bytes]]) -> tuple[list[LoadedFile], list[str]]:
     """Load many uploaded files, expanding zips and collecting per-file errors.
 
     Args:
@@ -200,11 +218,11 @@ def load_batch(files: list[tuple[str, bytes]]) -> tuple[list[tuple[str, ImageSou
             many pairs whose names carry the path within the folder.
 
     Returns:
-        ``(loaded, errors)``: the readable files as ``(name, source)`` pairs in
+        ``(loaded, errors)``: the readable files as :class:`LoadedFile` in
         display order, and one message per file that failed. Failures are
         returned rather than raised so one bad file cannot fail the batch.
     """
-    loaded: list[tuple[str, ImageSource]] = []
+    loaded: list[LoadedFile] = []
     errors: list[str] = []
 
     for filename, data in files:
@@ -217,7 +235,7 @@ def load_batch(files: list[tuple[str, bytes]]) -> tuple[list[tuple[str, ImageSou
             if _JUNK.search(name):
                 continue
             try:
-                loaded.append((name, load_one(name, payload)))
+                loaded.append(LoadedFile(name, load_one(name, payload), payload))
             except LoadError as e:
                 errors.append(str(e))
 

@@ -7,8 +7,8 @@
  * directly and the browser does the decoding.
  */
 import type {
-  Annotation, Draft, FrameInfo, ImageListing, PreviewResult, UploadResult,
-  Window, WorkspaceListing,
+  Annotation, Draft, FrameInfo, ImageListing, PreviewResult, SessionSummary,
+  UploadResult, Window, WorkspaceListing,
 } from './types'
 
 /**
@@ -72,6 +72,36 @@ export async function upload(files: File[], workspaceId: string | null,
  */
 export const getWorkspace = async (id: string) =>
   json<WorkspaceListing>(await fetch(`/workspaces/${id}`))
+
+/**
+ * Lists the sessions the server has saved.
+ *
+ * @return The sessions, most recently worked on first, and whether the server
+ *     is saving them at all -- `persist: false` means this build keeps state in
+ *     memory only and the list will be empty.
+ */
+export const listSessions = async () =>
+  json<{ persist: boolean; sessions: SessionSummary[] }>(await fetch('/sessions'))
+
+/**
+ * Reopens a saved session, images and masks included.
+ *
+ * @param id Workspace id from {@link listSessions}.
+ * @return The workspace listing, plus `errors` naming any file whose saved
+ *     bytes could not be read back.
+ */
+export const openSession = async (id: string) =>
+  json<WorkspaceListing & { errors: string[] }>(
+    await fetch(`/sessions/${id}/open`, { method: 'POST' }))
+
+/**
+ * Deletes a saved session from the server, for good.
+ *
+ * @param id Workspace id.
+ * @return The server's acknowledgement.
+ */
+export const deleteSession = async (id: string) =>
+  json<unknown>(await fetch(`/sessions/${id}`, { method: 'DELETE' }))
 
 /**
  * Fetches one frame's geometry and default window.

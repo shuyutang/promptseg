@@ -86,6 +86,24 @@ export type WorkspaceListing = {
   images: ImageListing[]
 }
 
+/**
+ * One session saved on the server, as the resume list shows it.
+ *
+ * Enough to recognise a session without opening it: what folder it was, when it
+ * was last worked on, how far it got and what was being labelled.
+ */
+export type SessionSummary = {
+  workspace_id: string
+  name: string
+  created_at: string
+  /** UTC ISO-8601; when the session was last annotated, not when it was made. */
+  updated_at: string
+  image_count: number
+  annotation_count: number
+  /** The distinct labels used anywhere in the session. */
+  labels: string[]
+}
+
 /** The result of an upload. `errors` names files that could not be read. */
 export type UploadResult = {
   workspace_id: string

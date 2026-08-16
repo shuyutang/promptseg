@@ -6,6 +6,7 @@ The documented list lives in ``docs/setup.md``.
 """
 from __future__ import annotations
 import os
+from pathlib import Path
 
 
 def _env_int(name: str, default: int) -> int:
@@ -45,6 +46,14 @@ class Settings:
             ``SAM2_MAX_EMBEDDINGS``. These are the memory hogs (~17 MB each).
         default_threshold: Probability above which a pixel is foreground, used
             when a request does not say.
+        persist: True unless ``SAM2_PERSIST=0``: write every session to disk as
+            it is annotated, so a restart does not lose work that was never
+            exported. Turning it off restores the memory-only behaviour, which
+            is the right choice where images must not be written out.
+        data_dir: Where the session database and the original file bytes live,
+            from ``SAM2_DATA_DIR``.
+        max_saved: How many saved sessions to keep before the least recently
+            touched are dropped, from ``SAM2_MAX_SAVED``. 0 keeps everything.
     """
 
     model_id: str = os.environ.get("SAM2_MODEL_ID", "facebook/sam2.1-hiera-base-plus")
@@ -56,6 +65,10 @@ class Settings:
     max_embeddings: int = _env_int("SAM2_MAX_EMBEDDINGS", 24)
 
     default_threshold: float = 0.5
+
+    persist: bool = os.environ.get("SAM2_PERSIST", "1") != "0"
+    data_dir: Path = Path(os.environ.get("SAM2_DATA_DIR", "~/.local/share/promptseg")).expanduser()
+    max_saved: int = _env_int("SAM2_MAX_SAVED", 20)
 
 
 settings = Settings()

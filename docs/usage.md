@@ -25,8 +25,8 @@
 6. Press `d` to mark the file done, `n` for the next one. The progress bar
    counts `n/8`.
 7. **Export annotations (JSON)** when finished — one document for the whole
-   folder.
-   Do it before stopping the server: state lives in memory only.
+   folder. No rush: the session is already saved, so this is how you get the
+   data *out*, not how you avoid losing it.
 
 ## Load
 
@@ -70,6 +70,23 @@ model call happens.
 
 The eraser removes whatever is under it, including model pixels — erasing
 exactly what you painted does not restore the original mask.
+
+## Stopping and coming back
+
+Nothing needs saving — every mask is written to disk as you commit it. When the
+server comes back up, **⟲ Saved** in the file list shows the sessions it still
+has, most recent first, with the folder name, how far it got and what was being
+labelled. Opening one puts everything back: images, masks, colours, instance
+numbers, done flags. Carrying on is indistinguishable from never having stopped.
+
+`×` deletes a saved session for good, images and all. Old ones are dropped
+automatically past `SAM2_MAX_SAVED` (20 by default), least recently worked on
+first.
+
+The saved copy includes the original files, so on a machine where images must
+not be written to disk, run with `SAM2_PERSIST=0` — the resume list then says
+so, and exporting is again the only way to keep anything. See
+[Setup](setup.md#saved-sessions).
 
 ## Export
 

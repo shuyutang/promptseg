@@ -3,10 +3,12 @@
 Endpoint docstrings are also what FastAPI publishes at ``/docs``, so they are
 written to be read there; ``docs/api.md`` lists the same routes in one table.
 
-Two things happen at import time and are worth knowing about. The model is
+Three things happen at import time and are worth knowing about. The model is
 constructed here, so the first server start blocks until the weights are
-downloaded and loaded. And the store's eviction hook is wired to the runner, so
-dropping a workspace also frees the embeddings its images were holding.
+downloaded and loaded. The store's eviction hook is wired to the runner, so
+dropping a workspace also frees the embeddings its images were holding. And the
+session database is opened, so annotating writes through to disk as it happens
+and a restart does not cost the user work they never exported.
 """
 from __future__ import annotations
 import io
@@ -27,8 +29,9 @@ from pydantic import BaseModel
 
 from config import settings
 from labels import canonical, hex_to_rgb
-from media.loader import load_batch
+from media.loader import load_batch, load_one
 from models.sam2_runner import Sam2Runner
+from persistence import SessionDB
 from schemas import (
     AnnotationCreate, AnnotationOut, AnnotationUpdate, PreviewRequest,
     Stroke, Window, WorkspaceCreate,
@@ -47,7 +50,31 @@ app.add_middleware(
 STATIC = Path(__file__).parent / "static"
 """Where the built frontend lives. Committed, so a fresh clone runs without Node."""
 
-store = Store()
+def _open_db() -> SessionDB | None:
+    """Open the session database, or carry on without one.
+
+    An unwritable data directory is a reason to lose persistence, not a reason
+    to refuse to start -- the tool is still fully usable with export as the only
+    way out, which is what it did before.
+
+    Returns:
+        The database, or None when persistence is off or unavailable.
+    """
+    if not settings.persist:
+        return None
+    try:
+        db = SessionDB(settings.data_dir)
+        db.prune(settings.max_saved)
+        return db
+    except Exception as e:                                  # noqa: BLE001
+        print(f"promptseg: sessions will not be saved ({type(e).__name__}: {e})")
+        return None
+
+
+db = _open_db()
+"""Durable session storage, or None when ``SAM2_PERSIST=0``."""
+
+store = Store(db=db)
 runner = Sam2Runner()
 store.on_evict = runner.drop_image
 
@@ -260,8 +287,10 @@ def health():
 
     Returns:
         The model id (or ``"stub"``), the device in use, how many embeddings are
-        cached and how many workspaces are resident. Checking ``device`` is the
-        quickest way to catch a CPU-only torch on a CUDA box.
+        cached, how many workspaces are resident and what the session store is
+        doing. Checking ``device`` is the quickest way to catch a CPU-only torch
+        on a CUDA box, and ``storage.error`` the quickest way to catch a data
+        directory that cannot be written.
     """
     return {
         "ok": True,
@@ -269,6 +298,8 @@ def health():
         "device": str(runner.device),
         "cached_embeddings": len(runner._cache),
         "workspaces": len(store.workspaces()),
+        "persist": db is not None,
+        "storage": db.stats() if db else None,
     }
 
 
@@ -315,6 +346,95 @@ def get_workspace(workspace_id: str):
     return _ws(workspace_id).to_listing()
 
 
+# ---- saved sessions ---------------------------------------------------
+
+@app.get("/sessions")
+def list_sessions():
+    """List the sessions on disk, so work can be picked up after a restart.
+
+    Returns:
+        ``{"persist": bool, "sessions": [...]}``. Each session carries its id,
+        name, timestamps, file and annotation counts and the labels used, which
+        is enough to recognise it without opening it. Most recently worked on
+        first. ``persist`` is False when the server is running memory-only, and
+        the list is then empty.
+    """
+    return {"persist": db is not None, "sessions": db.sessions() if db else []}
+
+
+@app.post("/sessions/{workspace_id}/open")
+def open_session(workspace_id: str):
+    """Reopen a saved session, putting its images and masks back.
+
+    The session keeps its identifiers, so this resumes the work rather than
+    copying it. A session that is already resident is returned as it stands,
+    which makes the call safe to repeat.
+
+    Args:
+        workspace_id: Workspace identifier, from :func:`list_sessions`.
+
+    Returns:
+        The workspace listing, in the same shape ``/workspaces/{id}`` returns,
+        plus ``errors`` naming any file whose saved bytes could not be read.
+
+    Raises:
+        HTTPException: 404 if no such session was saved; 503 if the server is
+            running memory-only.
+    """
+    if db is None:
+        raise HTTPException(503, "Sessions are not being saved (SAM2_PERSIST=0).")
+    try:
+        return {**store.get_workspace(workspace_id).to_listing(), "errors": []}
+    except KeyError:
+        pass
+
+    saved = db.load_workspace(workspace_id)
+    if saved is None:
+        raise HTTPException(404, f"Unknown session {workspace_id!r}")
+
+    images, errors = [], []
+    for img in saved.images:
+        if not img.data:
+            errors.append(f"{img.filename}: saved image data is missing")
+            continue
+        try:
+            source = load_one(img.filename, img.data)
+        except Exception as e:                              # noqa: BLE001
+            errors.append(f"{img.filename}: {e}")
+            continue
+        images.append({"image_id": img.image_id, "source": source,
+                       "filename": img.filename, "blob_sha": img.blob_sha,
+                       "reviewed": img.reviewed,
+                       "instances": img.instances, "created_at": img.created_at,
+                       "annotations": img.annotations})
+
+    ws = store.restore_workspace(saved.workspace_id, saved.name, saved.created_at,
+                                 saved.label_colors, images)
+    return {**ws.to_listing(), "errors": errors}
+
+
+@app.delete("/sessions/{workspace_id}")
+def delete_session(workspace_id: str):
+    """Forget a saved session, on disk and in memory.
+
+    Args:
+        workspace_id: Workspace identifier.
+
+    Returns:
+        The deleted id.
+
+    Raises:
+        HTTPException: 404 if no such session was saved; 503 if the server is
+            running memory-only.
+    """
+    if db is None:
+        raise HTTPException(503, "Sessions are not being saved (SAM2_PERSIST=0).")
+    store.forget_workspace(workspace_id)
+    if not db.delete_workspace(workspace_id):
+        raise HTTPException(404, f"Unknown session {workspace_id!r}")
+    return {"deleted": workspace_id}
+
+
 @app.post("/upload")
 async def upload(files: list[UploadFile] = File(...),
                  workspace_id: Optional[str] = Form(None),
@@ -352,9 +472,9 @@ async def upload(files: list[UploadFile] = File(...),
     )
 
     added = []
-    for filename, source in loaded:
+    for item in loaded:
         try:
-            rec = store.add_image(ws, source, filename)
+            rec = store.add_image(ws, item.source, item.name, item.data)
         except ValueError as e:
             errors.append(str(e))
             break
@@ -389,7 +509,7 @@ async def upload_single(file: UploadFile = File(...),
         raise HTTPException(400, "Failed to read image. " + "; ".join(errors[:3]))
 
     ws = _ws(workspace_id) if workspace_id else store.create_workspace(name)
-    recs = [store.add_image(ws, src, fname) for fname, src in loaded]
+    recs = [store.add_image(ws, i.source, i.name, i.data) for i in loaded]
     rec = recs[0]
     wc, ww = rec.source.default_window(0)
     return {
@@ -430,7 +550,7 @@ def patch_image(image_id: str, req: ImagePatch):
     """
     rec = _rec(image_id)
     if req.reviewed is not None:
-        rec.reviewed = bool(req.reviewed)
+        store.set_reviewed(rec, req.reviewed)
     return rec.to_listing()
 
 

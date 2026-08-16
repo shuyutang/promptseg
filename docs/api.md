@@ -13,6 +13,9 @@ Interactive docs are at `/docs` on the running server (FastAPI generates them).
 | `GET` | `/workspaces` | list |
 | `POST` | `/workspaces` | create an empty one |
 | `GET` | `/workspaces/{id}` | file list with per-file annotation counts and progress |
+| `GET` | `/sessions` | saved sessions, most recently worked on first; `persist: false` when the server is memory-only |
+| `POST` | `/sessions/{id}/open` | reopen a saved session, images and masks included; same ids as before |
+| `DELETE` | `/sessions/{id}` | forget a saved session, reclaiming its image bytes |
 | `PATCH` | `/images/{id}` | mark a file done |
 | `DELETE` | `/images/{id}` | drop a file from the workspace |
 | `GET` | `/frame_info` | per-image geometry, windowing support, default window |

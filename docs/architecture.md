@@ -61,7 +61,8 @@ workspace  ──  one folder-load; owns the label vocabulary and its colours
 ```
 backend/
   app.py            FastAPI routes
-  store.py          workspaces, images, annotations (in memory)
+  store.py          workspaces, images, annotations (the resident working copy)
+  persistence.py    the copy on disk: SQLite + content-addressed image blobs
   media/            format handling: base.py, dicom_source.py, raster_source.py, loader.py
   dicom/io.py       pixel decoding, windowing, palette/MONOCHROME1 handling
   models/           the SAM2 runner and its embedding cache
@@ -99,20 +100,23 @@ PNG/JPEG/TIFF — no downloads, no PHI.
 
 ```bash
 cd backend
-SAM2_STUB=1 ../.venv/bin/python -m pytest tests -q     # 63 passed, 5 skipped — no GPU, ~1 s
-SAM2_STUB=0 ../.venv/bin/python -m pytest tests -q     # 68 passed — adds the real-model ones
+SAM2_STUB=1 ../.venv/bin/python -m pytest tests -q     # 73 passed, 5 skipped — no GPU, ~1.5 s
+SAM2_STUB=0 ../.venv/bin/python -m pytest tests -q     # 78 passed — adds the real-model ones
 ```
 
 The five skipped ones (`tests/test_sam2_gpu.py`) assert what only a real
 checkpoint can show: plausible masks, candidates ranked by score, a negative
 point shrinking the mask, box prompts, and the cached edit actually being faster
 than the cold one. Everything else — loading, ordering, brush geometry, colours,
-export round-trips — runs against the stub.
+export round-trips — runs against the stub. The persistence tests restart the
+server for real, by reloading the application module against a temporary data
+directory, so nothing in memory survives into the assertion.
 
 ## Known limits
 
-- **State is in memory.** Restarting the server drops every workspace and
-  annotation. Export before you stop it.
+- **Saved sessions include the images.** Reopening one has to put the pixels
+  back, so the original files are copied into `SAM2_DATA_DIR` in the clear —
+  DICOM included. `SAM2_PERSIST=0` restores the memory-only behaviour.
 - **Single user.** No accounts, no locking; `allow_origins=["*"]`. Run it on
   localhost or behind something that does authentication.
 - **Zero-shot quality on grayscale is uneven.** SAM 2.1 is trained on natural

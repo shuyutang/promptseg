@@ -10,8 +10,11 @@ sends clicks to the wrong coordinates with no error at all.
 Colours are per workspace, never per image, which is what makes "liver" the same
 colour in every file of a folder -- the whole point of labelling a batch.
 
-Nothing here is persisted. Eviction is per workspace, never per image, so a
-folder cannot lose files mid-annotation.
+This is the working copy, and it is bounded: eviction is per workspace, never
+per image, so a folder cannot lose files mid-annotation. When a
+:class:`persistence.SessionDB` is attached, every mutation also writes through
+to disk, and an evicted workspace can be reopened from there -- eviction frees
+memory, it does not destroy work.
 """
 from __future__ import annotations
 import threading
@@ -100,6 +103,9 @@ class ImageRecord:
             out. Never decremented, so instance numbers stay stable when an
             annotation is deleted.
         reviewed: Whether the user marked this file done.
+        blob_sha: Digest of the original file bytes on disk, or ``""`` when
+            nothing is being persisted. This is what lets a saved session put
+            the pixels back, not just the masks.
         created_at: UTC ISO-8601 timestamp.
     """
     image_id: str
@@ -111,6 +117,7 @@ class ImageRecord:
     annotations: "OrderedDict[str, Annotation]" = field(default_factory=OrderedDict)
     _instance_counter: dict[str, int] = field(default_factory=dict)
     reviewed: bool = False
+    blob_sha: str = ""
     created_at: str = field(default_factory=_now)
 
     def next_instance(self, label: str) -> int:
@@ -254,7 +261,7 @@ class Workspace:
 
 
 class Store:
-    """In-memory session state. Bounded so a long-lived server cannot grow forever.
+    """Resident session state. Bounded so a long-lived server cannot grow forever.
 
     Workspaces are held in LRU order and evicted whole. Every mutating method
     takes a re-entrant lock, since FastAPI serves requests from a thread pool.
@@ -263,20 +270,51 @@ class Store:
         on_evict: Optional callback invoked with each ``image_id`` as it leaves
             the store. The app wires this to the runner so cached embeddings go
             with the images they belong to.
+        db: Optional :class:`persistence.SessionDB`. When set, every mutation
+            writes through, so nothing depends on the user remembering to
+            export. Eviction deliberately does *not* write through: dropping a
+            workspace from memory must not delete it from disk.
     """
 
-    def __init__(self, max_workspaces: int | None = None) -> None:
+    def __init__(self, max_workspaces: int | None = None, db=None) -> None:
         """Create an empty store.
 
         Args:
             max_workspaces: How many workspaces stay resident. Defaults to
                 ``settings.max_workspaces``.
+            db: Where to persist mutations, or None to keep state in memory
+                only.
         """
         self._workspaces: OrderedDict[str, Workspace] = OrderedDict()
         self._index: dict[str, ImageRecord] = {}     # image_id -> record
         self._max = max_workspaces or settings.max_workspaces
         self._lock = threading.RLock()
         self.on_evict = None
+        self.db = db
+
+    def _touch(self, ws: Workspace) -> None:
+        """Write a workspace's own row, including its label colours.
+
+        Called after anything that can assign a colour, so a reopened session
+        shows the same colours it was annotated in.
+
+        Args:
+            ws: The workspace to persist.
+        """
+        if self.db:
+            self.db.save_workspace(ws.workspace_id, ws.name, ws.created_at,
+                                   ws.labels.as_dict())
+
+    def _save(self, rec: ImageRecord) -> None:
+        """Write one image's row: its position, reviewed flag and instance counters.
+
+        Args:
+            rec: The record to persist. Its blob is written once, at upload.
+        """
+        if self.db and rec.blob_sha:
+            self.db.save_image(rec.image_id, rec.workspace_id, rec.index, rec.filename,
+                               rec.blob_sha, rec.reviewed, rec._instance_counter,
+                               rec.created_at)
 
     # ---- workspaces ---------------------------------------------------
 
@@ -293,6 +331,7 @@ class Store:
             ws = Workspace(workspace_id=str(uuid.uuid4()), name=name)
             self._workspaces[ws.workspace_id] = ws
             self._evict_locked()
+            self._touch(ws)
             return ws
 
     def get_workspace(self, workspace_id: str) -> Workspace:
@@ -322,6 +361,28 @@ class Store:
         with self._lock:
             return list(self._workspaces.values())
 
+    def forget_workspace(self, workspace_id: str) -> bool:
+        """Drop a workspace from memory, freeing its cached embeddings.
+
+        Does not touch the database: whether the saved copy also goes is the
+        caller's decision, and eviction never makes it.
+
+        Args:
+            workspace_id: Workspace identifier.
+
+        Returns:
+            True if it was resident.
+        """
+        with self._lock:
+            ws = self._workspaces.pop(workspace_id, None)
+            if ws is None:
+                return False
+            for image_id in ws.images:
+                self._index.pop(image_id, None)
+                if self.on_evict:
+                    self.on_evict(image_id)
+            return True
+
     def _evict_locked(self) -> None:
         """Drop least-recently-used workspaces until the cap is met.
 
@@ -338,13 +399,16 @@ class Store:
 
     # ---- images -------------------------------------------------------
 
-    def add_image(self, ws: Workspace, source: ImageSource, filename: str) -> ImageRecord:
+    def add_image(self, ws: Workspace, source: ImageSource, filename: str,
+                  data: bytes | None = None) -> ImageRecord:
         """Append a file to a workspace.
 
         Args:
             ws: Workspace to add to.
             source: The loaded file.
             filename: Path within the picked folder.
+            data: The original file bytes, kept so the session can be reopened
+                after a restart. Omit to add the image without persisting it.
 
         Returns:
             The new record, sharing the workspace's label registry.
@@ -366,6 +430,24 @@ class Store:
             ws.images[rec.image_id] = rec
             self._index[rec.image_id] = rec
             self._workspaces.move_to_end(ws.workspace_id)
+            if self.db and data:
+                rec.blob_sha = self.db.put_blob(data)
+                self._save(rec)
+            return rec
+
+    def set_reviewed(self, rec: ImageRecord, reviewed: bool) -> ImageRecord:
+        """Mark a file done, or not done.
+
+        Args:
+            rec: The image to mark.
+            reviewed: The new state.
+
+        Returns:
+            The same record.
+        """
+        with self._lock:
+            rec.reviewed = bool(reviewed)
+            self._save(rec)
             return rec
 
     def get(self, image_id: str) -> ImageRecord:
@@ -405,6 +487,9 @@ class Store:
                 ws.images.pop(image_id, None)
                 for i, r in enumerate(ws.images.values()):
                     r.index = i
+                    self._save(r)
+            if self.db:
+                self.db.delete_image(image_id, rec.workspace_id)
             if self.on_evict:
                 self.on_evict(image_id)
             return True
@@ -475,7 +560,27 @@ class Store:
                 strokes=list(strokes or []),
             )
             rec.annotations[ann.id] = ann
+            self._persist(rec, ann)
             return ann
+
+    def _persist(self, rec: ImageRecord, ann: Annotation) -> None:
+        """Write an annotation through, along with what it changed around it.
+
+        A new annotation can hand out an instance number and assign a label
+        colour, so the image row and the workspace row have to move with it or a
+        reopened session would renumber and recolour.
+
+        Args:
+            rec: The image the annotation belongs to.
+            ann: The annotation to persist.
+        """
+        if not self.db:
+            return
+        ws = self._workspaces.get(rec.workspace_id)
+        if ws:
+            self._touch(ws)
+        self._save(rec)
+        self.db.save_annotation(ann, rec.workspace_id)
 
     def update_annotation(self, rec: ImageRecord, ann: Annotation, *,
                           mask: np.ndarray | None = None, score: float | None = None,
@@ -523,6 +628,7 @@ class Store:
                 ann.score = score
 
             ann.updated_at = _now()
+            self._persist(rec, ann)
             return ann
 
     def delete_annotation(self, rec: ImageRecord, ann_id: str) -> bool:
@@ -539,4 +645,54 @@ class Store:
             True if it was there, False if it was not.
         """
         with self._lock:
-            return rec.annotations.pop(ann_id, None) is not None
+            gone = rec.annotations.pop(ann_id, None) is not None
+            if gone and self.db:
+                self.db.delete_annotation(ann_id, rec.workspace_id)
+            return gone
+
+    # ---- reopening -----------------------------------------------------
+
+    def restore_workspace(self, workspace_id: str, name: str, created_at: str,
+                          label_colors: dict[str, str],
+                          images: list[dict]) -> Workspace:
+        """Rebuild a saved session in memory, ids and all.
+
+        Identifiers are reused rather than reissued, so a reopened session is
+        the same session: bookmarked urls still resolve, and a later export
+        cannot be told apart from one taken before the restart. Nothing is
+        written back -- this is a read of what is already on disk.
+
+        Args:
+            workspace_id: Workspace identifier to restore under.
+            name: Display name.
+            created_at: UTC ISO-8601 timestamp of the original creation.
+            label_colors: Canonical label to hex colour, restored wholesale.
+            images: One dict per file, with keys ``image_id``, ``source``,
+                ``filename``, ``reviewed``, ``instances``, ``created_at`` and
+                ``annotations`` (dicts of :class:`Annotation` fields).
+
+        Returns:
+            The workspace, resident and most recently used.
+        """
+        with self._lock:
+            ws = Workspace(workspace_id=workspace_id, name=name, created_at=created_at)
+            ws.labels.restore(label_colors)
+            for i, item in enumerate(images):
+                rec = ImageRecord(
+                    image_id=item["image_id"], source=item["source"],
+                    filename=item["filename"], workspace_id=workspace_id, index=i,
+                    labels=ws.labels, reviewed=bool(item.get("reviewed")),
+                    blob_sha=item.get("blob_sha", ""),
+                    created_at=item.get("created_at") or _now(),
+                )
+                rec._instance_counter = dict(item.get("instances") or {})
+                for a in item.get("annotations") or []:
+                    ann = Annotation(image_id=rec.image_id, **a)
+                    rec.annotations[ann.id] = ann
+                ws.images[rec.image_id] = rec
+                self._index[rec.image_id] = rec
+
+            self._workspaces[workspace_id] = ws
+            self._workspaces.move_to_end(workspace_id)
+            self._evict_locked()
+            return ws

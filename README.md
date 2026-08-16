@@ -34,6 +34,9 @@ entirely and just look around. Node is not needed — the frontend ships built.
 - **One export for everything.** JSON for the whole workspace, optionally with a
   PNG per mask. Prompts and strokes are included, so an annotation is
   reproducible, not just readable.
+- **Nothing to lose.** Every mask is written to disk as you make it. Stop the
+  server, come back tomorrow, press **⟲ Saved** and carry on from where you
+  were — exporting is how you get data *out*, not how you avoid losing it.
 - **DICOM is first-class, not converted.** Window and level are live controls
   and the model is fed exactly the windowed frame you are looking at; palette,
   MONOCHROME1 and multi-frame files all decode natively. Everything else loads
@@ -51,5 +54,6 @@ entirely and just look around. Node is not needed — the frontend ships built.
 | [Architecture](docs/architecture.md) | How the encoder/decoder split works, the rules worth not breaking, layout, tests |
 | [API & export](docs/api.md) | Endpoints and the export schema |
 
-State is in memory only — export before stopping the server. Single user, no
-auth, 2D only; see [Known limits](docs/architecture.md#known-limits).
+Sessions are saved to `~/.local/share/promptseg` — images included — so set
+`SAM2_PERSIST=0` where that is not acceptable. Single user, no auth, 2D only;
+see [Known limits](docs/architecture.md#known-limits).
